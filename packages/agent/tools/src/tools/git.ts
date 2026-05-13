@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { reindexFiles } from "@gents/agent-db";
 import type { ToolDefinition } from "../types.js";
 import type { SpawnResult } from "../utils.js";
 import { truncate, spawnWithTimeout } from "../utils.js";
@@ -83,6 +84,26 @@ export const gitCommitTool: ToolDefinition = {
         signal: context.signal,
       });
       lines.push(formatGitResult(commitResult));
+
+      if (commitResult.exitCode === 0 && context.db.workspace) {
+        try {
+          const diffResult = await spawnWithTimeout(
+            ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
+            { cwd: context.workingDir, signal: context.signal },
+          );
+          if (diffResult.exitCode === 0) {
+            const changed = diffResult.stdout
+              .trim()
+              .split("\n")
+              .filter(Boolean);
+            if (changed.length > 0) {
+              reindexFiles(context.db.workspace, changed);
+            }
+          }
+        } catch {
+          // Non-fatal: index will catch up on next incremental pass.
+        }
+      }
 
       return truncate(lines.join("\n"));
     } catch (e) {

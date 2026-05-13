@@ -139,6 +139,7 @@ export function createAgentDB(dbPath: string, opts?: CreateDBOptions): AgentDB {
     dbPath,
     repoPath,
     modelLoaded,
+    workspace: opts?.workspace,
   };
 }
 

@@ -3,6 +3,8 @@ export * from "./errors";
 export * from "./schema";
 export * from "./uuid";
 export * from "./database";
+export * from "./workspace";
+export * from "./chunker";
 export * from "./conversation";
 export * from "./events";
 export * from "./metrics";

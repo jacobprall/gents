@@ -1,6 +1,7 @@
 import { sqlError } from "./errors";
 import { globMatch } from "./glob";
 import type { AgentDB, SearchOptions, SearchResult } from "./types";
+import { getWorkspaceHandle } from "./workspace";
 
 const RRF_K = 60;
 
@@ -27,11 +28,23 @@ function matchesFilters(r: SearchResult, languages?: string[], paths?: string[])
 }
 
 function probeVectorScan(db: AgentDB): boolean {
+  const ws = db.workspace;
+  if (ws) {
+    if (ws.vectorAvailable !== undefined) return ws.vectorAvailable;
+    let available = false;
+    try {
+      ws.db.prepare(`SELECT 1 FROM vector_quantize_scan('code_chunks', 'embedding', ?, 1) LIMIT 1`).get(new Uint8Array(4));
+      available = true;
+    } catch {
+      available = false;
+    }
+    (ws as { vectorAvailable?: boolean }).vectorAvailable = available;
+    return available;
+  }
   if (db.vectorAvailable !== undefined) return db.vectorAvailable;
   let available = false;
   try {
-    const stmt = db.db.prepare(`SELECT 1 FROM vector_quantize_scan('code_chunks', 'embedding', ?, 1) LIMIT 1`);
-    stmt.get(new Uint8Array(4));
+    db.db.prepare(`SELECT 1 FROM vector_quantize_scan('code_chunks', 'embedding', ?, 1) LIMIT 1`).get(new Uint8Array(4));
     available = true;
   } catch {
     available = false;
@@ -143,20 +156,21 @@ function mergeRrf(
 export function hybridSearch(db: AgentDB, query: string, opts?: SearchOptions): SearchResult[] {
   if (!query.trim()) return [];
 
+  const wsHandle = getWorkspaceHandle(db);
   const limit = opts?.limit ?? 20;
   const bm25Weight = opts?.bm25Weight ?? 0.3;
   const vectorWeight = opts?.vectorWeight ?? 0.7;
   const fetchLimit = Math.max(limit * 5, 50);
 
   const match = ftsMatchExpression(query);
-  const bm25Raw = bm25Search(db.db, match, fetchLimit);
+  const bm25Raw = bm25Search(wsHandle, match, fetchLimit);
 
   let vectorList: SearchResult[] = [];
   if (probeVectorScan(db)) {
-    const emb = tryQueryEmbedding(db.db, query);
+    const emb = tryQueryEmbedding(wsHandle, query);
     if (emb) {
       try {
-        vectorList = vectorSearch(db.db, emb, fetchLimit);
+        vectorList = vectorSearch(wsHandle, emb, fetchLimit);
       } catch (e) {
         console.warn(`[gents] vector search failed, falling back to BM25-only: ${e instanceof Error ? e.message : String(e)}`);
       }

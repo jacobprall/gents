@@ -1,7 +1,9 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { sqlError } from "./errors";
 import type { AgentDB, Skill } from "./types";
+
+// --- DB queries ---
 
 export function getSkill(db: AgentDB, name: string): Skill | undefined {
   try {
@@ -36,6 +38,47 @@ export function listSkills(db: AgentDB): Skill[] {
   }
 }
 
+export interface SkillCatalogEntry {
+  name: string;
+  description: string;
+  source: string;
+}
+
+/** Returns name + description for every skill (lightweight, no instructions). */
+export function listSkillCatalog(db: AgentDB): SkillCatalogEntry[] {
+  try {
+    return db.db
+      .prepare(`SELECT name, description, source FROM skills ORDER BY name`)
+      .all() as SkillCatalogEntry[];
+  } catch (e) {
+    throw sqlError("listSkillCatalog", e);
+  }
+}
+
+/** Fetch a supporting file for a skill by relative path. */
+export function getSkillFile(db: AgentDB, skillName: string, filePath: string): string | undefined {
+  try {
+    const row = db.db
+      .prepare(`SELECT content FROM skill_files WHERE skill_name = ? AND path = ?`)
+      .get(skillName, filePath) as { content: string } | null;
+    return row?.content;
+  } catch (e) {
+    throw sqlError("getSkillFile", e);
+  }
+}
+
+/** List all supporting file paths for a skill. */
+export function listSkillFiles(db: AgentDB, skillName: string): string[] {
+  try {
+    const rows = db.db
+      .prepare(`SELECT path FROM skill_files WHERE skill_name = ? ORDER BY path`)
+      .all(skillName) as { path: string }[];
+    return rows.map((r) => r.path);
+  } catch (e) {
+    throw sqlError("listSkillFiles", e);
+  }
+}
+
 export function upsertSkill(db: AgentDB, skill: Skill): void {
   try {
     db.db
@@ -49,60 +92,174 @@ export function upsertSkill(db: AgentDB, skill: Skill): void {
   }
 }
 
-// --- Filesystem-based skill loading ---
+function upsertSkillFile(db: AgentDB, skillName: string, filePath: string, content: string): void {
+  db.db
+    .prepare(
+      `INSERT OR REPLACE INTO skill_files (skill_name, path, content, created_at)
+       VALUES (?, ?, ?, ?)`,
+    )
+    .run(skillName, filePath, content, Date.now());
+}
+
+function deleteSkillFiles(db: AgentDB, skillName: string): void {
+  db.db.prepare(`DELETE FROM skill_files WHERE skill_name = ?`).run(skillName);
+}
+
+// --- Frontmatter parsing ---
 
 const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
 
-/**
- * Parse a single `.md` skill file into a Skill.
- * Supports optional YAML frontmatter with `name` and `description` fields.
- * Falls back to the filename (minus extension) as the skill name.
- */
-export function parseSkillFile(filePath: string, contents: string): Skill {
-  const basename = path.basename(filePath, ".md");
-  let name = basename;
-  let description = "";
-  let body = contents;
+interface SkillFrontmatter {
+  name?: string;
+  description?: string;
+}
 
+function parseFrontmatter(contents: string): { frontmatter: SkillFrontmatter; body: string } {
   const match = FRONTMATTER_RE.exec(contents);
-  if (match) {
-    body = contents.slice(match[0].length);
-    const frontmatter = match[1]!;
-    for (const line of frontmatter.split("\n")) {
-      const colonIdx = line.indexOf(":");
-      if (colonIdx === -1) continue;
-      const key = line.slice(0, colonIdx).trim();
-      const value = line.slice(colonIdx + 1).trim().replace(/^["']|["']$/g, "");
-      if (key === "name" && value) name = value;
-      if (key === "description" && value) description = value;
-    }
-  }
+  if (!match) return { frontmatter: {}, body: contents };
 
-  return {
-    name,
-    description,
-    instructions: body.trim(),
-    source: "user",
-  };
+  const body = contents.slice(match[0].length);
+  const raw = parseYamlLite(match[1]!);
+  const fm: SkillFrontmatter = {};
+  if (raw.name) fm.name = raw.name;
+  if (raw.description) fm.description = raw.description;
+
+  return { frontmatter: fm, body };
 }
 
 /**
- * Load all `.md` skill files from a directory.
- * Returns an empty array if the directory doesn't exist.
- * Pure function — no DB writes.
+ * Minimal YAML parser that handles scalar values, quoted strings,
+ * and YAML folded/literal block scalars (>-, |-, >, |) plus
+ * indented continuation lines.
  */
-export function loadSkillsFromDir(dir: string): Skill[] {
-  if (!existsSync(dir)) return [];
+function parseYamlLite(text: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  const lines = text.split("\n");
+  let i = 0;
 
-  const entries = readdirSync(dir, { withFileTypes: true });
-  const skills: Skill[] = [];
+  while (i < lines.length) {
+    const line = lines[i]!;
+    const colonIdx = line.indexOf(":");
+    if (colonIdx === -1 || line[0] === " " || line[0] === "\t") {
+      i++;
+      continue;
+    }
 
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
-    const filePath = path.join(dir, entry.name);
-    const contents = readFileSync(filePath, "utf-8");
-    skills.push(parseSkillFile(filePath, contents));
+    const key = line.slice(0, colonIdx).trim();
+    let value = line.slice(colonIdx + 1).trim();
+
+    if (value === ">-" || value === "|-" || value === ">" || value === "|") {
+      const parts: string[] = [];
+      i++;
+      while (i < lines.length && (lines[i]!.startsWith("  ") || lines[i]!.trim() === "")) {
+        parts.push(lines[i]!.replace(/^  /, ""));
+        i++;
+      }
+      const joined = value.startsWith(">")
+        ? parts.join(" ").replace(/\s+/g, " ").trim()
+        : parts.join("\n").trim();
+      if (key && joined) result[key] = joined;
+      continue;
+    }
+
+    value = value.replace(/^["']|["']$/g, "");
+    if (key && value) result[key] = value;
+    i++;
   }
 
-  return skills.sort((a, b) => a.name.localeCompare(b.name));
+  return result;
+}
+
+// --- Filesystem scanning ---
+
+export interface SkillDirConfig {
+  dir: string;
+  source: "builtin" | "user";
+}
+
+/**
+ * Walk a directory recursively collecting all `.md` files.
+ * Returns paths relative to `baseDir`.
+ */
+function walkMdFiles(baseDir: string): string[] {
+  const results: string[] = [];
+
+  function walk(dir: string): void {
+    const entries = readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(fullPath);
+      } else if (entry.isFile() && entry.name.endsWith(".md")) {
+        results.push(path.relative(baseDir, fullPath));
+      }
+    }
+  }
+
+  walk(baseDir);
+  return results;
+}
+
+/**
+ * Scan a single skill directory (a directory containing SKILL.md + supporting files).
+ * Upserts the skill and all its supporting files into the DB.
+ */
+function scanSingleSkill(db: AgentDB, skillDir: string, source: "builtin" | "user"): void {
+  const skillMdPath = path.join(skillDir, "SKILL.md");
+  if (!existsSync(skillMdPath)) return;
+
+  const contents = readFileSync(skillMdPath, "utf-8");
+  const { frontmatter, body } = parseFrontmatter(contents);
+  const dirName = path.basename(skillDir);
+  const name = frontmatter.name ?? dirName;
+  const description = frontmatter.description ?? "";
+
+  upsertSkill(db, {
+    name,
+    description,
+    instructions: body.trim(),
+    source,
+  });
+
+  deleteSkillFiles(db, name);
+
+  const allMdFiles = walkMdFiles(skillDir);
+  for (const relPath of allMdFiles) {
+    if (relPath === "SKILL.md") continue;
+    const filePath = path.join(skillDir, relPath);
+    const fileContents = readFileSync(filePath, "utf-8");
+    upsertSkillFile(db, name, relPath, fileContents);
+  }
+}
+
+/**
+ * Scan skill directories and upsert all discovered skills + files into the DB.
+ * Directories are processed in order; later entries override earlier ones by name,
+ * so pass builtins first and user skills second.
+ */
+export function scanSkillDirs(db: AgentDB, dirs: SkillDirConfig[]): void {
+  const tx = db.db.transaction(() => {
+    for (const { dir, source } of dirs) {
+      if (!existsSync(dir)) continue;
+
+      const entries = readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const skillDir = path.join(dir, entry.name);
+        try {
+          const st = statSync(path.join(skillDir, "SKILL.md"));
+          if (!st.isFile()) continue;
+        } catch {
+          continue;
+        }
+        scanSingleSkill(db, skillDir, source);
+      }
+    }
+  });
+
+  try {
+    tx();
+  } catch (e) {
+    throw sqlError("scanSkillDirs", e);
+  }
 }

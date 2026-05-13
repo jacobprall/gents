@@ -1,7 +1,7 @@
 import path from "node:path";
 import { readdir } from "node:fs/promises";
 import { z } from "zod";
-import { hybridSearch } from "@gents/agent-db";
+import { hybridSearch, validateAndRefreshResults } from "@gents/agent-db";
 import type { SearchOptions, SearchResult } from "@gents/agent-db";
 import type { ToolDefinition } from "../types.js";
 import { truncate } from "../utils.js";
@@ -138,7 +138,10 @@ export const codeSearchTool: ToolDefinition = {
       };
 
       try {
-        const results = hybridSearch(context.db, parsed.query, opts);
+        let results = hybridSearch(context.db, parsed.query, opts);
+        if (context.db.workspace) {
+          results = validateAndRefreshResults(context.db.workspace, results);
+        }
         return formatHybridResults(results);
       } catch {
         return await grepFallback(context.repoPath, parsed.query, {

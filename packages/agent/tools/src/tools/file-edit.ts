@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { ToolDefinition } from "../types.js";
 import { resolveSafePath, assertFileSizeLimit } from "../utils.js";
+import { tryWriteThrough } from "../write-through.js";
 
 const inputSchema = z.object({
   path: z.string().describe("File path relative to the repository root"),
@@ -32,6 +33,7 @@ export const fileEditTool: ToolDefinition = {
       }
       const next = text.slice(0, first) + newString + text.slice(first + oldString.length);
       await Bun.write(abs, next);
+      tryWriteThrough(context.db, filePath, next);
       return `Updated ${filePath} (${oldString.length} chars → ${newString.length} chars)`;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

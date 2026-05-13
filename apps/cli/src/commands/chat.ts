@@ -1,12 +1,13 @@
 import { createAgentLoop, createChildLoopFactory, type LoopEvent } from "@gents/agent-loop";
 import {
+  closeWorkspaceDB,
   compactConversation,
   getCurrentTurn,
   getIndexStatus,
   getSessionMetrics,
   hybridSearch,
   indexCodebase,
-  loadSkillsFromDir,
+  scanSkillDirs,
 } from "@gents/agent-db";
 import {
   confirmationGate,
@@ -21,47 +22,66 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 
 import {
-  bold,
-  cyan,
-  dim,
+  accent,
+  muted,
+  success,
+  Spinner,
+  printBanner,
   printCost,
   printDebug,
   printError,
+  printHelp,
   printInfo,
   printToolComplete,
   printToolError,
   printToolStart,
+  printTurnSeparator,
 } from "../display";
 import { resolveConfig } from "../config";
 import { createDefaultPrompt } from "../prompt";
-import { openSession } from "../session";
+import { createRenderer } from "../markdown";
+import { openSession, openWorkspace } from "../session";
+
+const spinner = new Spinner();
+let md = createRenderer();
 
 function handleLoopEvent(event: LoopEvent): void {
   switch (event.type) {
     case "turn.started":
+      md = createRenderer();
+      spinner.start("Thinking...");
       break;
 
     case "llm.streaming":
-      process.stdout.write(event.delta);
+      spinner.stop();
+      md.write(event.delta);
       break;
 
     case "llm.complete":
+      spinner.stop();
+      md.flush();
       process.stdout.write("\n");
       break;
 
     case "tool.calling":
+      spinner.stop();
+      md.flush();
       printToolStart(event.name, event.input);
       break;
 
     case "tool.complete":
       printToolComplete(event.name, event.output, event.durationMs);
+      spinner.start("Thinking...");
       break;
 
     case "tool.error":
       printToolError(event.name, event.error);
+      spinner.start("Thinking...");
       break;
 
     case "turn.complete":
+      spinner.stop();
+      md.flush();
       printCost({
         model: event.cost.model,
         inputTokens: event.cost.inputTokens,
@@ -72,25 +92,31 @@ function handleLoopEvent(event: LoopEvent): void {
       break;
 
     case "error":
+      spinner.stop();
       printError(event.error.message);
       break;
 
     case "paused":
-      printInfo(dim(`Paused: ${event.reason}`));
+      spinner.stop();
+      printInfo(muted(`Paused: ${event.reason}`));
       break;
   }
 }
 
 async function confirmationPromptFn(toolName: string, input: unknown): Promise<boolean> {
+  spinner.stop();
   return await new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     const preview =
       typeof input === "object" && input !== null ? JSON.stringify(input).slice(0, 200) : String(input);
-    rl.question(`Approve tool "${toolName}"? ${preview}\n[y/N] `, (ans) => {
-      rl.close();
-      const t = ans.trim().toLowerCase();
-      resolve(t === "y" || t === "yes");
-    });
+    rl.question(
+      `  ${accent(toolName)} ${muted(preview)}\n  ${muted("approve?")} [y/N] `,
+      (ans) => {
+        rl.close();
+        const t = ans.trim().toLowerCase();
+        resolve(t === "y" || t === "yes");
+      },
+    );
   });
 }
 
@@ -106,13 +132,7 @@ async function handleSlashCommand(
 
   switch (cmd) {
     case "help": {
-      printInfo(`
-  ${cyan("/compact")} [summary]  — Compact conversation history (summary optional)
-  ${cyan("/search")} <query>   — Hybrid search over the codebase index
-  ${cyan("/index")}           — Rebuild/update the codebase index for this repo
-  ${cyan("/cost")}            — Session cost and token metrics
-  ${cyan("/status")}          — Index + session status
-  ${cyan("/exit")}, ${cyan("/quit")}    — Quit the REPL`);
+      printHelp();
       break;
     }
     case "compact": {
@@ -120,7 +140,7 @@ async function handleSlashCommand(
       const summary =
         argRest.length > 0 ? argRest : "[Compaction via /compact — summarize earlier turns in subsequent context]";
       compactConversation(db, turn, summary);
-      printInfo(dim(`Compaction marker recorded through turn ${String(turn)}.`));
+      printInfo(muted(`  Compaction marker recorded through turn ${String(turn)}.`));
       break;
     }
     case "search": {
@@ -131,41 +151,48 @@ async function handleSlashCommand(
       }
       const hits = hybridSearch(db, q, { limit: 15 });
       if (hits.length === 0) {
-        printInfo("No hits.");
+        printInfo("  No hits.");
         break;
       }
       for (const r of hits) {
-        console.log(
-          `\n  ${cyan(r.path)}:${String(r.startLine)}-${String(r.endLine)} ${dim(`(score: ${r.score.toFixed(2)})`)}`,
+        process.stdout.write(
+          `\n  ${accent(r.path)}:${String(r.startLine)}-${String(r.endLine)} ${muted(`(score: ${r.score.toFixed(2)})`)}\n`,
         );
-        console.log(`  ${"─".repeat(40)}`);
+        process.stdout.write(`  ${muted("─".repeat(40))}\n`);
         const lines = r.chunkText.split("\n");
-        for (const ln of lines.slice(0, 6)) console.log(`  ${ln}`);
-        if (lines.length > 6) console.log(dim("  ..."));
+        for (const ln of lines.slice(0, 6)) process.stdout.write(`  ${ln}\n`);
+        if (lines.length > 6) process.stdout.write(`${muted("  ...")}\n`);
       }
-      console.log("");
+      process.stdout.write("\n");
       break;
     }
     case "index": {
-      printInfo(`Indexing ${repoPath}…`);
+      const idxSpinner = new Spinner();
+      idxSpinner.start("Indexing...");
       const result = indexCodebase(db, repoPath);
-      printInfo(
-        `Indexed ${String(result.filesScanned)} files, ${String(result.chunksCreated)} chunks in ${String(result.elapsedMs)}ms`,
+      idxSpinner.stop();
+      process.stdout.write(
+        `  ${success("✔")} Indexed ${String(result.filesScanned)} files, ${String(result.chunksCreated)} chunks in ${(result.elapsedMs / 1000).toFixed(1)}s\n`,
       );
       break;
     }
     case "cost": {
       const m = getSessionMetrics(db);
-      printInfo(
-        `Turns ${String(m.totalTurns)}, tokens ${String(m.totalInputTokens)} in / ${String(m.totalOutputTokens)} out, tools ${String(m.totalToolCalls)}, $${m.totalCostUsd.toFixed(6)}`,
-      );
+      const parts = [
+        `${String(m.totalTurns)} turns`,
+        `${String(m.totalInputTokens)} in`,
+        `${String(m.totalOutputTokens)} out`,
+        `${String(m.totalToolCalls)} tools`,
+        `$${m.totalCostUsd.toFixed(4)}`,
+      ];
+      printInfo(`  ${parts.join(` ${muted("·")} `)}`);
       break;
     }
     case "status": {
       const st = getIndexStatus(db);
       const m = getSessionMetrics(db);
-      printInfo(`Index: ${String(st.totalFiles)} files, ${String(st.totalChunks)} chunks`);
-      printInfo(`Session: ${String(m.totalTurns)} turns, cost $${m.totalCostUsd.toFixed(6)}`);
+      printInfo(`  ${muted("index")}    ${String(st.totalFiles)} files, ${String(st.totalChunks)} chunks`);
+      printInfo(`  ${muted("session")}  ${String(m.totalTurns)} turns, $${m.totalCostUsd.toFixed(4)}`);
       break;
     }
     default:
@@ -197,21 +224,34 @@ export const chatCommand = new Command("chat")
           model: opts.model,
           ...(typeof opts.confirm === "boolean" ? { confirmDestructive: opts.confirm } : {}),
         });
+
+        const workspace = openWorkspace(repoPath);
         const db = openSession(repoPath, {
           session: opts.session,
           forceNew: Boolean(opts.new),
+          workspace,
         });
 
         if (opts.index !== false && config.autoIndex) {
           const status = getIndexStatus(db);
-          if (status.totalChunks === 0) {
-            printInfo("Building initial code index...");
+          const isInitial = status.totalChunks === 0;
+          if (isInitial) {
+            const idxSpinner = new Spinner();
+            idxSpinner.start("Building initial code index...");
             const result = indexCodebase(db, repoPath);
-            printInfo(
-              `Indexed ${String(result.filesScanned)} files, ${String(result.chunksCreated)} chunks in ${String(result.elapsedMs)}ms`,
+            idxSpinner.stop();
+            process.stdout.write(
+              `  ${success("✔")} Indexed ${String(result.filesScanned)} files, ${String(result.chunksCreated)} chunks in ${(result.elapsedMs / 1000).toFixed(1)}s\n`,
             );
           } else {
-            printDebug(`Index: ${String(status.totalChunks)} chunks from ${String(status.totalFiles)} files`);
+            const result = indexCodebase(db, repoPath);
+            if (result.filesChanged > 0) {
+              printDebug(
+                `Index refreshed: ${String(result.filesChanged)} files updated, ${String(result.chunksCreated)} chunks in ${(result.elapsedMs / 1000).toFixed(1)}s`,
+              );
+            } else {
+              printDebug(`Index: ${String(status.totalChunks)} chunks from ${String(status.totalFiles)} files (up to date)`);
+            }
           }
         }
 
@@ -236,12 +276,14 @@ export const chatCommand = new Command("chat")
         ];
         const hooks = createHookPipeline(hookList);
 
-        const skills = loadSkillsFromDir(path.join(repoPath, ".gents", "skills"));
-        if (skills.length > 0) {
-          printDebug(`Loaded ${String(skills.length)} skill(s): ${skills.map((s) => s.name).join(", ")}`);
-        }
+        const bundledSkillsDir = path.resolve(import.meta.dir, "../../../../skills/bundled");
+        const userSkillsDir = path.join(repoPath, ".gents", "skills");
+        scanSkillDirs(db, [
+          { dir: bundledSkillsDir, source: "builtin" },
+          { dir: userSkillsDir, source: "user" },
+        ]);
 
-        const prompt = createDefaultPrompt(toolDefs, skills);
+        const prompt = createDefaultPrompt(toolDefs);
 
         const childLoopFactory = createChildLoopFactory({
           model: config.model,
@@ -281,28 +323,33 @@ export const chatCommand = new Command("chat")
         const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
         const shutdown = (code?: number): void => {
+          spinner.stop();
           rl.close();
+          try { closeWorkspaceDB(workspace); } catch { /* best effort */ }
           process.exit(code ?? 0);
         };
 
         rl.on("close", () => {
-          printInfo(dim("Goodbye."));
+          printInfo(muted("\n  🎩 Goodbye."));
         });
 
         process.once("SIGINT", () => {
+          spinner.stop();
           process.stdout.write("\n");
           shutdown(130);
         });
 
-        console.log(`\n  ${bold("gents")} v0.1.0`);
-        console.log(`  Session: ${opts.session} | Model: ${config.model}`);
-        console.log(`  Repo: ${repoPath}`);
-        console.log(`  Type ${cyan("/help")} for commands, ${cyan("/exit")} to quit.\n`);
+        printBanner({
+          version: "0.1.0",
+          session: opts.session,
+          model: config.model,
+          repoPath,
+        });
 
         let busy = false;
 
         const promptUser = (): void => {
-          rl.question("\n  You: ", (input: string) => {
+          rl.question(`\n  ${accent("❯")} `, (input: string) => {
             void (async () => {
               const trimmed = input.trim();
               if (!trimmed || trimmed === "/exit" || trimmed === "/quit") {
@@ -317,18 +364,20 @@ export const chatCommand = new Command("chat")
               }
 
               if (busy) {
-                printInfo("Still processing the previous message. Please wait.");
+                printInfo("  Still processing the previous message. Please wait.");
                 promptUser();
                 return;
               }
 
               busy = true;
+              printTurnSeparator();
               process.stdout.write("\n");
               try {
                 for await (const event of loop.run(db, trimmed)) {
                   handleLoopEvent(event);
                 }
               } catch (e) {
+                spinner.stop();
                 printError(e instanceof Error ? e.message : String(e));
               }
               busy = false;

@@ -1,4 +1,5 @@
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
+export const WORKSPACE_SCHEMA_VERSION = 1;
 
 export interface Migration {
   version: number;
@@ -6,11 +7,9 @@ export interface Migration {
 }
 
 /**
- * Ordered list of migrations. Each entry upgrades from (version-1) to version.
+ * Ordered list of session-DB migrations.
  *
- * IMPORTANT: When adding a migration, also update SCHEMA_SQL below to include
- * the same changes. SCHEMA_SQL is the canonical "latest full schema" applied to
- * fresh databases; migrations handle upgrades from older versions.
+ * IMPORTANT: When adding a migration, also update SESSION_SCHEMA_SQL below.
  */
 export const MIGRATIONS: Migration[] = [
   {
@@ -47,8 +46,97 @@ CREATE TABLE IF NOT EXISTS subagent_defs (
 );
 `,
   },
+  {
+    version: 4,
+    sql: `
+CREATE TABLE IF NOT EXISTS skill_files (
+  skill_name TEXT NOT NULL,
+  path TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (skill_name, path),
+  FOREIGN KEY (skill_name) REFERENCES skills(name) ON DELETE CASCADE
+);
+`,
+  },
 ];
 
+export const WORKSPACE_MIGRATIONS: Migration[] = [];
+
+// ---------------------------------------------------------------------------
+// Workspace schema — shared across all agent sessions on the same workspace.
+// Contains the code index, file tree, and exclude patterns.
+// ---------------------------------------------------------------------------
+
+export const WORKSPACE_SCHEMA_SQL = `
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS schema_version (
+  version INTEGER PRIMARY KEY,
+  applied_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS file_tree (
+  path TEXT PRIMARY KEY,
+  hash TEXT NOT NULL,
+  size INTEGER,
+  modified_at INTEGER,
+  language TEXT,
+  indexed_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS code_chunks (
+  rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+  path TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  language TEXT,
+  chunk_text TEXT NOT NULL,
+  embedding BLOB
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunks_path ON code_chunks(path);
+CREATE INDEX IF NOT EXISTS idx_chunks_language ON code_chunks(language);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS code_fts USING fts5(
+  path,
+  chunk_text,
+  language,
+  content='code_chunks',
+  content_rowid='rowid',
+  tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS code_chunks_ai AFTER INSERT ON code_chunks BEGIN
+  INSERT INTO code_fts(rowid, path, chunk_text, language)
+  VALUES (new.rowid, new.path, new.chunk_text, new.language);
+END;
+
+CREATE TRIGGER IF NOT EXISTS code_chunks_ad AFTER DELETE ON code_chunks BEGIN
+  INSERT INTO code_fts(code_fts, rowid, path, chunk_text, language)
+  VALUES ('delete', old.rowid, old.path, old.chunk_text, old.language);
+END;
+
+CREATE TRIGGER IF NOT EXISTS code_chunks_au AFTER UPDATE ON code_chunks BEGIN
+  INSERT INTO code_fts(code_fts, rowid, path, chunk_text, language)
+  VALUES ('delete', old.rowid, old.path, old.chunk_text, old.language);
+  INSERT INTO code_fts(rowid, path, chunk_text, language)
+  VALUES (new.rowid, new.path, new.chunk_text, new.language);
+END;
+
+CREATE TABLE IF NOT EXISTS exclude_patterns (
+  pattern TEXT PRIMARY KEY,
+  source TEXT NOT NULL DEFAULT 'default'
+);
+`;
+
+// ---------------------------------------------------------------------------
+// Session schema — per-agent conversation, metrics, skills, tools, etc.
+// Legacy single-DB mode still includes the workspace tables for backward compat.
+// ---------------------------------------------------------------------------
+
+/** @deprecated Use WORKSPACE_SCHEMA_SQL + SESSION_SCHEMA_SQL for new setups. */
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
 
@@ -204,6 +292,15 @@ CREATE TABLE IF NOT EXISTS subagent_defs (
   max_cost_usd REAL,
   source TEXT NOT NULL DEFAULT 'builtin',
   created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS skill_files (
+  skill_name TEXT NOT NULL,
+  path TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (skill_name, path),
+  FOREIGN KEY (skill_name) REFERENCES skills(name) ON DELETE CASCADE
 );
 `;
 

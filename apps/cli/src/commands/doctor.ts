@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 
-import { bold, dim, green, red, yellow } from "../display";
+import { bold, muted, success, error, warning } from "../display";
 import { globalConfigPath } from "../config";
 import { getDbPath, getGentsDir } from "../session";
 
@@ -12,36 +12,37 @@ interface Check {
   label: string;
   status: Status;
   detail?: string;
+  group: string;
 }
 
 function icon(s: Status): string {
   switch (s) {
     case "pass":
-      return green("✔");
+      return success("✔");
     case "warn":
-      return yellow("⚠");
+      return warning("⚠");
     case "fail":
-      return red("✖");
+      return error("✖");
   }
 }
 
 function checkBunRuntime(): Check {
   const version = typeof Bun !== "undefined" ? Bun.version : undefined;
   if (!version) {
-    return { label: "Bun runtime", status: "fail", detail: "Not running under Bun. Install from https://bun.sh" };
+    return { label: "Bun runtime", status: "fail", detail: "Not running under Bun. Install from https://bun.sh", group: "Runtime" };
   }
   const [major] = version.split(".");
   if (Number(major) < 1) {
-    return { label: "Bun runtime", status: "warn", detail: `v${version} — upgrade to >=1.0 recommended` };
+    return { label: "Bun runtime", status: "warn", detail: `v${version} — upgrade to >=1.0 recommended`, group: "Runtime" };
   }
-  return { label: "Bun runtime", status: "pass", detail: `v${version}` };
+  return { label: "Bun runtime", status: "pass", detail: `v${version}`, group: "Runtime" };
 }
 
 function checkApiKey(): Check {
   if (process.env.ANTHROPIC_API_KEY) {
     const key = process.env.ANTHROPIC_API_KEY;
     const masked = `${key.slice(0, 8)}...${key.slice(-4)}`;
-    return { label: "Anthropic API key", status: "pass", detail: `env ANTHROPIC_API_KEY (${masked})` };
+    return { label: "Anthropic API key", status: "pass", detail: `env ANTHROPIC_API_KEY (${masked})`, group: "Auth" };
   }
 
   const cfgPath = globalConfigPath();
@@ -51,7 +52,7 @@ function checkApiKey(): Check {
       if (typeof raw.anthropic_api_key === "string" && raw.anthropic_api_key.length > 0) {
         const key = raw.anthropic_api_key;
         const masked = `${key.slice(0, 8)}...${key.slice(-4)}`;
-        return { label: "Anthropic API key", status: "pass", detail: `config (${masked})` };
+        return { label: "Anthropic API key", status: "pass", detail: `config (${masked})`, group: "Auth" };
       }
     } catch {
       /* handled below */
@@ -62,36 +63,38 @@ function checkApiKey(): Check {
     label: "Anthropic API key",
     status: "fail",
     detail: "Not found. Set ANTHROPIC_API_KEY or run: gents config set anthropic_api_key <key>",
+    group: "Auth",
   };
 }
 
 function checkGlobalConfig(): Check {
   const cfgPath = globalConfigPath();
   if (!existsSync(cfgPath)) {
-    return { label: "Global config", status: "warn", detail: `${cfgPath} — not created yet (using defaults)` };
+    return { label: "Global config", status: "warn", detail: `${cfgPath} — not created yet (using defaults)`, group: "Auth" };
   }
 
   try {
     const content = readFileSync(cfgPath, "utf8");
     const parsed = JSON.parse(content) as unknown;
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return { label: "Global config", status: "fail", detail: `${cfgPath} — not a JSON object` };
+      return { label: "Global config", status: "fail", detail: `${cfgPath} — not a JSON object`, group: "Auth" };
     }
   } catch (e) {
     return {
       label: "Global config",
       status: "fail",
       detail: `${cfgPath} — invalid JSON: ${e instanceof Error ? e.message : String(e)}`,
+      group: "Auth",
     };
   }
 
-  return { label: "Global config", status: "pass", detail: cfgPath };
+  return { label: "Global config", status: "pass", detail: cfgPath, group: "Auth" };
 }
 
 function checkConfigPermissions(): Check {
   const cfgPath = globalConfigPath();
   if (!existsSync(cfgPath)) {
-    return { label: "Config permissions", status: "pass", detail: "No config file yet" };
+    return { label: "Config permissions", status: "pass", detail: "No config file yet", group: "Auth" };
   }
 
   try {
@@ -102,11 +105,12 @@ function checkConfigPermissions(): Check {
         label: "Config permissions",
         status: "warn",
         detail: `${cfgPath} is ${mode} — recommend 600 (contains API key). Run: chmod 600 "${cfgPath}"`,
+        group: "Auth",
       };
     }
-    return { label: "Config permissions", status: "pass", detail: `${mode}` };
+    return { label: "Config permissions", status: "pass", detail: `${mode}`, group: "Auth" };
   } catch {
-    return { label: "Config permissions", status: "warn", detail: "Could not stat config file" };
+    return { label: "Config permissions", status: "warn", detail: "Could not stat config file", group: "Auth" };
   }
 }
 
@@ -115,9 +119,9 @@ async function checkGit(): Promise<Check> {
     const proc = Bun.spawn(["git", "--version"], { stdout: "pipe", stderr: "pipe" });
     const text = await new Response(proc.stdout).text();
     const match = text.match(/(\d+\.\d+\.\d+)/);
-    return { label: "Git", status: "pass", detail: match ? `v${match[1]}` : text.trim() };
+    return { label: "Git", status: "pass", detail: match ? `v${match[1]}` : text.trim(), group: "Runtime" };
   } catch {
-    return { label: "Git", status: "warn", detail: "git not found — git tools will be unavailable" };
+    return { label: "Git", status: "warn", detail: "git not found — git tools will be unavailable", group: "Runtime" };
   }
 }
 
@@ -125,44 +129,45 @@ function checkRepoGentsDir(repoPath: string): Check {
   const gentsDir = getGentsDir(repoPath);
   if (!existsSync(gentsDir)) {
     return {
-      label: "Repo .gents/ directory",
+      label: ".gents/ directory",
       status: "warn",
       detail: `Not found at ${gentsDir} — will be created on first gents chat`,
+      group: "Repository",
     };
   }
-  return { label: "Repo .gents/ directory", status: "pass", detail: gentsDir };
+  return { label: ".gents/ directory", status: "pass", detail: gentsDir, group: "Repository" };
 }
 
 function checkDefaultSession(repoPath: string): Check {
   const dbPath = getDbPath(repoPath, "default");
   if (!existsSync(dbPath)) {
-    return { label: "Default session DB", status: "warn", detail: "No default session yet" };
+    return { label: "Default session DB", status: "warn", detail: "No default session yet", group: "Repository" };
   }
 
   try {
     const st = statSync(dbPath);
     const sizeKb = (st.size / 1024).toFixed(0);
-    return { label: "Default session DB", status: "pass", detail: `${dbPath} (${sizeKb} KB)` };
+    return { label: "Default session DB", status: "pass", detail: `${dbPath} (${sizeKb} KB)`, group: "Repository" };
   } catch {
-    return { label: "Default session DB", status: "warn", detail: "Could not stat database file" };
+    return { label: "Default session DB", status: "warn", detail: "Could not stat database file", group: "Repository" };
   }
 }
 
 function checkSessions(repoPath: string): Check {
   const sessionsDir = path.join(getGentsDir(repoPath), "sessions");
   if (!existsSync(sessionsDir)) {
-    return { label: "Named sessions", status: "pass", detail: "None (only default)" };
+    return { label: "Named sessions", status: "pass", detail: "None (only default)", group: "Repository" };
   }
 
   try {
     const files = readdirSync(sessionsDir).filter((f) => f.endsWith(".agent.db"));
     if (files.length === 0) {
-      return { label: "Named sessions", status: "pass", detail: "None" };
+      return { label: "Named sessions", status: "pass", detail: "None", group: "Repository" };
     }
     const names = files.map((f) => f.replace(".agent.db", ""));
-    return { label: "Named sessions", status: "pass", detail: `${String(files.length)}: ${names.join(", ")}` };
+    return { label: "Named sessions", status: "pass", detail: `${String(files.length)}: ${names.join(", ")}`, group: "Repository" };
   } catch {
-    return { label: "Named sessions", status: "warn", detail: "Could not read sessions directory" };
+    return { label: "Named sessions", status: "warn", detail: "Could not read sessions directory", group: "Repository" };
   }
 }
 
@@ -173,6 +178,7 @@ function checkSqliteExtensions(repoPath: string): Check {
       label: "SQLite extensions",
       status: "warn",
       detail: "No database to test — run gents chat first, then re-check",
+      group: "Runtime",
     };
   }
 
@@ -202,14 +208,16 @@ function checkSqliteExtensions(repoPath: string): Check {
         label: "SQLite extensions",
         status: "warn",
         detail: "Neither sqlite-vector nor sqlite-ai detected — semantic search and local embeddings unavailable",
+        group: "Runtime",
       };
     }
-    return { label: "SQLite extensions", status: "pass", detail: exts.join(", ") };
+    return { label: "SQLite extensions", status: "pass", detail: exts.join(", "), group: "Runtime" };
   } catch (e) {
     return {
       label: "SQLite extensions",
       status: "warn",
       detail: `Could not probe: ${e instanceof Error ? e.message : String(e)}`,
+      group: "Runtime",
     };
   }
 }
@@ -223,14 +231,14 @@ export const doctorCommand = new Command("doctor")
 
     const checks: Check[] = [
       checkBunRuntime(),
+      await checkGit(),
+      checkSqliteExtensions(repoPath),
       checkApiKey(),
       checkGlobalConfig(),
       checkConfigPermissions(),
-      await checkGit(),
       checkRepoGentsDir(repoPath),
       checkDefaultSession(repoPath),
       checkSessions(repoPath),
-      checkSqliteExtensions(repoPath),
     ];
 
     if (opts.json) {
@@ -241,23 +249,32 @@ export const doctorCommand = new Command("doctor")
     const fails = checks.filter((c) => c.status === "fail").length;
     const warns = checks.filter((c) => c.status === "warn").length;
 
-    console.log(`\n  ${bold("gents doctor")}\n`);
+    process.stdout.write(`\n  ${bold("gents doctor")}\n`);
 
-    for (const check of checks) {
-      const detail = check.detail ? dim(` — ${check.detail}`) : "";
-      console.log(`  ${icon(check.status)} ${check.label}${detail}`);
+    const groups = ["Runtime", "Auth", "Repository"];
+    for (const group of groups) {
+      const groupChecks = checks.filter((c) => c.group === group);
+      if (groupChecks.length === 0) continue;
+
+      process.stdout.write(`\n  ${muted(group)}\n`);
+      process.stdout.write(`  ${muted("─".repeat(40))}\n`);
+
+      for (const check of groupChecks) {
+        const detail = check.detail ? muted(` — ${check.detail}`) : "";
+        process.stdout.write(`  ${icon(check.status)} ${check.label}${detail}\n`);
+      }
     }
 
-    console.log("");
+    process.stdout.write("\n");
 
     if (fails > 0) {
-      console.log(`  ${red(String(fails))} problem${fails > 1 ? "s" : ""} found.`);
+      process.stdout.write(`  ${error(`${String(fails)} problem${fails > 1 ? "s" : ""} found.`)}\n`);
       process.exitCode = 1;
     } else if (warns > 0) {
-      console.log(`  ${yellow(String(warns))} warning${warns > 1 ? "s" : ""}, no critical issues.`);
+      process.stdout.write(`  ${warning(`${String(warns)} warning${warns > 1 ? "s" : ""}, no critical issues.`)}\n`);
     } else {
-      console.log(`  ${green("All checks passed.")}`);
+      process.stdout.write(`  ${success("All checks passed.")}\n`);
     }
 
-    console.log("");
+    process.stdout.write("\n");
   });

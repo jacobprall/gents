@@ -3,6 +3,7 @@ import path from "node:path";
 import { z } from "zod";
 import type { ToolDefinition } from "../types.js";
 import { resolveSafePath, MAX_FILE_SIZE } from "../utils.js";
+import { tryWriteThrough } from "../write-through.js";
 
 const inputSchema = z.object({
   path: z.string().describe("File path relative to the repository root"),
@@ -24,6 +25,7 @@ export const fileWriteTool: ToolDefinition = {
       const abs = resolveSafePath(context.repoPath, filePath);
       await mkdir(path.dirname(abs), { recursive: true });
       await Bun.write(abs, content);
+      tryWriteThrough(context.db, filePath, content);
       return `Wrote ${content.length} bytes to ${filePath}`;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

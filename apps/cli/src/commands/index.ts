@@ -2,7 +2,7 @@ import { getIndexStatus, indexCodebase } from "@gents/agent-db";
 import { Command } from "commander";
 import * as path from "node:path";
 
-import { printInfo } from "../display";
+import { muted, success, Spinner } from "../display";
 import { openSession } from "../session";
 
 export const indexCommand = new Command("index")
@@ -15,19 +15,19 @@ export const indexCommand = new Command("index")
     const repoPath = path.resolve(opts.repo);
     const db = openSession(repoPath, { session: opts.session });
 
-    printInfo(`Indexing ${repoPath}...`);
+    const spinner = new Spinner();
+    spinner.start("Indexing...");
     const result = indexCodebase(db, repoPath, { forceReindex: Boolean(opts.force) });
+    spinner.stop();
 
-    console.log(`  Files scanned: ${String(result.filesScanned)}`);
-    console.log(`  Changed: ${String(result.filesChanged)}`);
-    console.log(`  Chunks created: ${String(result.chunksCreated)}`);
-    console.log(`  Time: ${(result.elapsedMs / 1000).toFixed(1)}s`);
+    process.stdout.write(`  ${success("✔")} Indexed in ${(result.elapsedMs / 1000).toFixed(1)}s\n`);
+    process.stdout.write(`  ${muted("files")}    ${String(result.filesScanned)} scanned, ${String(result.filesChanged)} changed\n`);
+    process.stdout.write(`  ${muted("chunks")}   ${String(result.chunksCreated)} created\n`);
 
     if (opts.stats) {
       const status = getIndexStatus(db);
-      console.log(`\n  Total files: ${String(status.totalFiles)}`);
-      console.log(`  Total chunks: ${String(status.totalChunks)}`);
+      process.stdout.write(`\n  ${muted("totals")}   ${String(status.totalFiles)} files, ${String(status.totalChunks)} chunks\n`);
       const langs = Object.entries(status.languageBreakdown).sort((a, b) => b[1]! - a[1]!);
-      console.log(`  Languages: ${langs.map(([l, c]) => `${l} (${String(c)})`).join(", ")}`);
+      process.stdout.write(`  ${muted("langs")}    ${langs.map(([l, c]) => `${l} (${String(c)})`).join(", ")}\n`);
     }
   });

@@ -1,11 +1,26 @@
 import type { Database } from "bun:sqlite";
 
+/**
+ * Shared workspace-level index DB. One per workspace, used by all agent
+ * sessions targeting the same directory tree. Contains the file tree,
+ * code chunks, FTS index, and exclude patterns.
+ */
+export interface WorkspaceDB {
+  readonly db: Database;
+  readonly dbPath: string;
+  readonly workspacePath: string;
+  readonly modelLoaded: boolean;
+  vectorAvailable?: boolean;
+}
+
 export interface AgentDB {
   readonly db: Database;
   readonly repoPath: string;
   readonly dbPath: string;
   readonly modelLoaded: boolean;
-  /** Cached result of vector extension probe (undefined = not yet tested). */
+  /** Shared workspace index. When set, search/index operations use this DB. */
+  readonly workspace?: WorkspaceDB;
+  /** @deprecated Use workspace.vectorAvailable instead when workspace is set. */
   vectorAvailable?: boolean;
 }
 
@@ -143,6 +158,7 @@ export interface CreateDBOptions {
   modelPath?: string;
   repoPath?: string;
   blueprint?: AgentBlueprint;
+  workspace?: WorkspaceDB;
 }
 
 export interface IndexOptions {

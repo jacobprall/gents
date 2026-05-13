@@ -1,6 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
-import { createAgentDB, type AgentDB } from "@gents/agent-db";
+import { createAgentDB, createWorkspaceDB, type AgentDB, type WorkspaceDB } from "@gents/agent-db";
 
 export function getGentsDir(repoPath: string): string {
   return path.join(repoPath, ".gents");
@@ -14,7 +14,18 @@ export function getDbPath(repoPath: string, session?: string): string {
   return path.join(dir, "sessions", `${session}.agent.db`);
 }
 
-export function openSession(repoPath: string, opts?: { session?: string; forceNew?: boolean }): AgentDB {
+/**
+ * Open the shared workspace index DB. Created once per workspace at
+ * `.gents/workspace.sqlite`; all sessions share the same index.
+ */
+export function openWorkspace(repoPath: string): WorkspaceDB {
+  return createWorkspaceDB(repoPath);
+}
+
+export function openSession(
+  repoPath: string,
+  opts?: { session?: string; forceNew?: boolean; workspace?: WorkspaceDB },
+): AgentDB {
   const dbPath = getDbPath(repoPath, opts?.session);
   const dir = path.dirname(dbPath);
   if (!existsSync(dir)) {
@@ -30,5 +41,5 @@ export function openSession(repoPath: string, opts?: { session?: string; forceNe
     unlinkSync(dbPath);
   }
 
-  return createAgentDB(dbPath, { repoPath });
+  return createAgentDB(dbPath, { repoPath, workspace: opts?.workspace });
 }

@@ -1,49 +1,145 @@
 export const COLORS_ENABLED = !process.env.GENTS_NO_COLOR && !process.env.NO_COLOR;
 
-function dim(s: string): string {
-  return COLORS_ENABLED ? `\x1b[2m${s}\x1b[0m` : s;
-}
-function bold(s: string): string {
-  return COLORS_ENABLED ? `\x1b[1m${s}\x1b[0m` : s;
-}
-function green(s: string): string {
-  return COLORS_ENABLED ? `\x1b[32m${s}\x1b[0m` : s;
-}
-function red(s: string): string {
-  return COLORS_ENABLED ? `\x1b[31m${s}\x1b[0m` : s;
-}
-function cyan(s: string): string {
-  return COLORS_ENABLED ? `\x1b[36m${s}\x1b[0m` : s;
-}
-function yellow(s: string): string {
-  return COLORS_ENABLED ? `\x1b[33m${s}\x1b[0m` : s;
+const TRUECOLOR =
+  COLORS_ENABLED &&
+  (process.env.COLORTERM === "truecolor" || process.env.COLORTERM === "24bit");
+
+function ansi(code: string): (s: string) => string {
+  return (s) => (COLORS_ENABLED ? `\x1b[${code}m${s}\x1b[0m` : s);
 }
 
-export { bold, cyan, dim, green, red, yellow };
+function rgb(r: number, g: number, b: number, fallbackCode: string): (s: string) => string {
+  if (!COLORS_ENABLED) return (s) => s;
+  if (TRUECOLOR) return (s) => `\x1b[38;2;${r};${g};${b}m${s}\x1b[0m`;
+  return ansi(fallbackCode);
+}
+
+// ── Base formatters ──────────────────────────────────────────────────────
+
+export const dim = ansi("2");
+export const bold = ansi("1");
+export const italic = ansi("3");
+export const underline = ansi("4");
+export const strikethrough = ansi("9");
+export const boldDim = (s: string): string =>
+  COLORS_ENABLED ? `\x1b[1;2m${s}\x1b[0m` : s;
+
+// ── Semantic palette ─────────────────────────────────────────────────────
+
+export const accent = rgb(138, 180, 248, "36");
+export const success = rgb(129, 199, 132, "32");
+export const error = rgb(239, 154, 154, "31");
+export const warning = rgb(255, 213, 79, "33");
+
+export const green = ansi("32");
+export const red = ansi("31");
+export const cyan = ansi("36");
+export const yellow = ansi("33");
+
+export const muted = dim;
+export const highlight = bold;
+
+// ── Spinner ──────────────────────────────────────────────────────────────
+
+const BRAILLE_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+export class Spinner {
+  private interval: ReturnType<typeof setInterval> | null = null;
+  private frameIdx = 0;
+
+  start(text: string): void {
+    this.frameIdx = 0;
+    this.render(text);
+    this.interval = setInterval(() => {
+      this.frameIdx++;
+      this.render(text);
+    }, 80);
+  }
+
+  stop(): void {
+    if (this.interval) {
+      clearInterval(this.interval);
+      this.interval = null;
+      process.stdout.write("\r\x1b[2K");
+    }
+  }
+
+  private render(text: string): void {
+    const frame = BRAILLE_FRAMES[this.frameIdx % BRAILLE_FRAMES.length]!;
+    process.stdout.write(`\r\x1b[2K  ${muted(frame)} ${muted(text)}`);
+  }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+export function shortenPath(p: string): string {
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
+  if (home && p.startsWith(home)) return "~" + p.slice(home.length);
+  return p;
+}
+
+function humanTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${String(ms)}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+// ── Tool output ──────────────────────────────────────────────────────────
 
 export function printToolStart(name: string, input: unknown): void {
   const summary =
-    typeof input === "object" && input !== null ? JSON.stringify(input).slice(0, 80) : String(input);
-  process.stdout.write(`  ${dim("┌")} ${cyan(name)} ${dim(summary)}\n`);
+    typeof input === "object" && input !== null
+      ? JSON.stringify(input).slice(0, 80)
+      : String(input);
+  process.stdout.write(`  ${muted("┌")} ${accent(name)} ${muted(summary)}\n`);
 }
 
 export function printToolComplete(name: string, output: string, durationMs: number): void {
-  void name;
+  const isFileOp = /^file_(edit|write|patch)$/.test(name);
   const lines = output.split("\n");
-  const maxShow = 10;
-  for (const line of lines.slice(0, maxShow)) {
-    process.stdout.write(`  ${dim("│")} ${line}\n`);
+
+  if (isFileOp && output.includes("@@")) {
+    printDiffLines(lines);
+  } else {
+    const maxShow = 5;
+    for (const line of lines.slice(0, maxShow)) {
+      process.stdout.write(`  ${muted("│")} ${line}\n`);
+    }
+    if (lines.length > maxShow) {
+      process.stdout.write(
+        `  ${muted("│")} ${muted(`... ${String(lines.length - maxShow)} more lines`)}\n`,
+      );
+    }
   }
-  if (lines.length > maxShow) {
-    process.stdout.write(`  ${dim("│")} ${dim(`...${String(lines.length - maxShow)} more lines`)}\n`);
-  }
-  process.stdout.write(`  ${dim("└")} ${dim(`done (${String(durationMs)}ms)`)}\n\n`);
+
+  process.stdout.write(`  ${muted("└")} ${muted(formatDuration(durationMs))}\n\n`);
 }
 
-export function printToolError(name: string, error: string): void {
-  void name;
-  process.stdout.write(`  ${dim("└")} ${red("error:")} ${error}\n\n`);
+function printDiffLines(lines: string[]): void {
+  for (const line of lines) {
+    if (line.startsWith("+")) {
+      process.stdout.write(`  ${muted("│")} ${success(line)}\n`);
+    } else if (line.startsWith("-")) {
+      process.stdout.write(`  ${muted("│")} ${error(line)}\n`);
+    } else if (line.startsWith("@@")) {
+      process.stdout.write(`  ${muted("│")} ${muted(line)}\n`);
+    } else {
+      process.stdout.write(`  ${muted("│")} ${line}\n`);
+    }
+  }
 }
+
+export function printToolError(name: string, err: string): void {
+  void name;
+  process.stdout.write(`  ${muted("└")} ${error("error:")} ${err}\n\n`);
+}
+
+// ── Cost / turn footer ──────────────────────────────────────────────────
 
 export function printCost(cost: {
   model: string;
@@ -52,27 +148,107 @@ export function printCost(cost: {
   costUsd: number;
   turnNumber: number;
 }): void {
-  process.stdout.write(
-    dim(
-      `  [turn ${String(cost.turnNumber)}] ${cost.model} — ${String(cost.inputTokens)} in / ${String(cost.outputTokens)} out — $${cost.costUsd.toFixed(6)}\n\n`,
-    ),
-  );
+  const parts = [
+    `turn ${String(cost.turnNumber)}`,
+    `${humanTokens(cost.inputTokens)} in`,
+    `${humanTokens(cost.outputTokens)} out`,
+    `$${cost.costUsd.toFixed(4)}`,
+    cost.model,
+  ];
+  process.stdout.write(muted(`  ${parts.join(" · ")}\n`));
 }
 
+// ── Turn separator ──────────────────────────────────────────────────────
+
+export function printTurnSeparator(): void {
+  process.stdout.write(`\n${muted("  ────────────────────────────────────────")}\n`);
+}
+
+// ── Standard messages ────────────────────────────────────────────────────
+
 export function printError(msg: string): void {
-  process.stderr.write(`${red("Error:")} ${msg}\n`);
+  process.stderr.write(`${error("error:")} ${msg}\n`);
 }
 
 export function printInfo(msg: string): void {
-  process.stdout.write(`${dim(msg)}\n`);
+  process.stdout.write(`${muted(msg)}\n`);
 }
 
 export function printWarn(msg: string): void {
-  process.stderr.write(`${yellow("Warning:")} ${msg}\n`);
+  process.stderr.write(`${warning("warning:")} ${msg}\n`);
 }
 
 export function printDebug(msg: string): void {
   if (process.env.GENTS_VERBOSE === "1" || process.env.DEBUG) {
-    process.stderr.write(`${dim(`[debug] ${msg}`)}\n`);
+    process.stderr.write(`${muted(`[debug] ${msg}`)}\n`);
   }
+}
+
+// ── Banner ──────────────────────────────────────────────────────────────
+
+const BOWTIE = [
+  `  ${accent("|\\                     /|")}`,
+  `  ${accent("|  \\                 /  |")}`,
+  `  ${accent("|    \\             /    |")}`,
+  `  ${accent("|      \\         /      |")}`,
+  `  ${accent("|       \\_______/       |")}`,
+  `  ${accent("|       |       |       |")}`,
+  `  ${accent("|       |       |       |")}`,
+  `  ${accent("|       |_______|       |")}`,
+  `  ${accent("|       /       \\       |")}`,
+  `  ${accent("|      /         \\      |")}`,
+  `  ${accent("|    /             \\    |")}`,
+  `  ${accent("|  /                 \\  |")}`,
+  `  ${accent("|/                     \\|")}`,
+];
+
+export function printBanner(opts: {
+  version: string;
+  session: string;
+  model: string;
+  repoPath: string;
+}): void {
+  const repo = shortenPath(opts.repoPath);
+
+  const title = `${bold("gents")} ${muted(`v${opts.version}`)}`;
+  const titleRaw = `gents v${opts.version}`;
+  const pad = Math.max(0, Math.floor((25 - titleRaw.length) / 2));
+
+  process.stdout.write("\n");
+  for (const line of BOWTIE) {
+    process.stdout.write(line + "\n");
+  }
+  process.stdout.write(`  ${" ".repeat(pad)}${title}\n`);
+  process.stdout.write("\n");
+  process.stdout.write(`  ${muted("session")}  ${opts.session}\n`);
+  process.stdout.write(`  ${muted("model")}    ${opts.model}\n`);
+  process.stdout.write(`  ${muted("repo")}     ${repo}\n`);
+  process.stdout.write("\n");
+  process.stdout.write(
+    `  Type ${accent("/help")} for commands ${muted("·")} ${accent("/exit")} to quit\n\n`,
+  );
+}
+
+// ── Help ─────────────────────────────────────────────────────────────────
+
+export function printHelp(): void {
+  const cmd = (name: string, args: string, desc: string): string => {
+    const left = `${accent(name)} ${muted(args)}`;
+    const rawLen = name.length + 1 + args.length;
+    const padding = Math.max(1, 20 - rawLen);
+    return `  ${left}${" ".repeat(padding)}${muted(desc)}`;
+  };
+
+  process.stdout.write("\n");
+  process.stdout.write(`  ${bold("Commands")}\n\n`);
+  process.stdout.write(cmd("/compact", "[msg]", "Compact conversation history") + "\n");
+  process.stdout.write(cmd("/search", " <q>", "Search the codebase index") + "\n");
+  process.stdout.write(cmd("/index", "    ", "Rebuild the codebase index") + "\n");
+  process.stdout.write("\n");
+  process.stdout.write(cmd("/cost", "     ", "Session cost and token usage") + "\n");
+  process.stdout.write(cmd("/status", "   ", "Index and session status") + "\n");
+  process.stdout.write(cmd("/help", "     ", "Show this help") + "\n");
+  process.stdout.write("\n");
+  process.stdout.write(cmd("/exit", "     ", "End session") + "\n");
+  process.stdout.write("\n");
 }

@@ -1,8 +1,11 @@
 import { statSync, readFileSync, readdirSync, existsSync, lstatSync } from "node:fs";
 import { join, relative, normalize } from "node:path";
 import { sqlError } from "./errors";
-import type { AgentDB, FileEntry, IndexOptions, IndexResult, IndexStatus, TreeDiff } from "./types";
+import type { AgentDB, FileEntry, IndexOptions, IndexResult, IndexStatus, TreeDiff, WorkspaceDB } from "./types";
 import { getExcludePatterns } from "./file-tree";
+import { getWorkspaceHandle } from "./workspace";
+import { globMatch } from "./glob";
+import { languageFromExt, sha256Hex, chunkFileContent } from "./chunker";
 
 const BINARY_EXTENSIONS = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "tif", "tiff",
@@ -12,8 +15,6 @@ const BINARY_EXTENSIONS = new Set([
   "exe", "dll", "so", "dylib", "bin", "o", "a",
   "class", "jar", "wasm", "sqlite", "db", "parquet", "gifv",
 ]);
-
-import { globMatch } from "./glob";
 
 // --- Gitignore handling (supports nested .gitignore files) ---
 
@@ -65,121 +66,11 @@ function gitIgnored(rel: string, isDir: boolean, rules: GitRule[]): boolean {
   return ignored;
 }
 
-// --- Language detection ---
-
-const LANGUAGE_MAP: Record<string, string> = {
-  ts: "typescript", tsx: "typescript", mts: "typescript", cts: "typescript",
-  js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript",
-  py: "python", pyi: "python",
-  rs: "rust", go: "go", java: "java",
-  kt: "kotlin", kts: "kotlin",
-  c: "c", h: "c",
-  cc: "cpp", cpp: "cpp", cxx: "cpp", hpp: "cpp", hh: "cpp",
-  rb: "ruby",
-  md: "markdown", mdx: "markdown",
-  json: "json", yaml: "yaml", yml: "yaml", toml: "toml", xml: "xml",
-  html: "html", css: "css", scss: "scss", sql: "sql",
-  sh: "shell", bash: "shell", zsh: "shell",
-  swift: "swift", scala: "scala", dart: "dart", lua: "lua",
-  ex: "elixir", exs: "elixir",
-  hs: "haskell", cs: "csharp", fs: "fsharp", vb: "vb", php: "php",
-};
-
-function languageFromExt(filePath: string): string | null {
-  const base = filePath.split("/").pop() ?? filePath;
-  const dot = base.lastIndexOf(".");
-  if (dot <= 0) return null;
-  const ext = base.slice(dot + 1).toLowerCase();
-  return LANGUAGE_MAP[ext] ?? null;
-}
-
 function isBinaryPath(rel: string): boolean {
   const seg = rel.split("/").pop() ?? rel;
   const dot = seg.lastIndexOf(".");
   if (dot <= 0) return false;
   return BINARY_EXTENSIONS.has(seg.slice(dot + 1).toLowerCase());
-}
-
-function sha256Hex(data: string | Uint8Array): string {
-  const h = new Bun.CryptoHasher("sha256");
-  if (typeof data === "string") h.update(data);
-  else h.update(data);
-  return h.digest("hex");
-}
-
-// --- Chunking with accurate line tracking ---
-
-interface ChunkPart {
-  text: string;
-  startLine: number;
-  endLine: number;
-}
-
-/**
- * Split on double-newline boundaries then subdivide long blocks with overlap.
- * Tracks actual newlines consumed (including multiple blank lines) to keep line numbers accurate.
- */
-function chunkFileContent(content: string, chunkSize: number, overlap: number, minChunk: number): ChunkPart[] {
-  const normalized = content.replace(/\r\n/g, "\n");
-  if (!normalized.trim()) return [];
-
-  const lines = normalized.split("\n");
-  const totalLines = lines.length;
-  const result: ChunkPart[] = [];
-
-  let i = 0;
-  while (i < totalLines) {
-    while (i < totalLines && lines[i]!.trim() === "") i++;
-    if (i >= totalLines) break;
-
-    const blockStart = i;
-    while (i < totalLines && !(i > blockStart && lines[i]!.trim() === "" && (i + 1 >= totalLines || lines[i + 1]!.trim() === ""))) {
-      i++;
-    }
-    const blockEnd = i;
-
-    const blockLines = lines.slice(blockStart, blockEnd);
-    const blockText = blockLines.join("\n");
-
-    if (blockText.length <= chunkSize) {
-      const t = blockText.trim();
-      if (t && (t.length >= minChunk || result.length === 0)) {
-        result.push({ text: t, startLine: blockStart + 1, endLine: blockEnd });
-      } else if (t && result.length > 0) {
-        const prev = result[result.length - 1]!;
-        prev.text = `${prev.text}\n\n${t}`;
-        prev.endLine = blockEnd;
-      }
-    } else {
-      let li = 0;
-      while (li < blockLines.length) {
-        let accLen = 0;
-        let lj = li;
-        while (lj < blockLines.length && accLen < chunkSize) {
-          accLen += blockLines[lj]!.length + (lj > li ? 1 : 0);
-          lj++;
-        }
-        if (lj === li) lj = li + 1;
-        const slice = blockLines.slice(li, lj).join("\n").trim();
-        if (slice) {
-          if (slice.length >= minChunk || result.length === 0) {
-            result.push({ text: slice, startLine: blockStart + li + 1, endLine: blockStart + lj });
-          } else {
-            const prev = result[result.length - 1]!;
-            prev.text = `${prev.text}\n\n${slice}`;
-            prev.endLine = blockStart + lj;
-          }
-        }
-        if (lj >= blockLines.length) break;
-        const overlapLines = Math.max(1, Math.ceil(overlap / 80));
-        li = Math.max(li + 1, lj - overlapLines);
-      }
-    }
-
-    while (i < totalLines && lines[i]!.trim() === "") i++;
-  }
-
-  return result;
 }
 
 // --- File walking ---
@@ -236,8 +127,8 @@ function listSourceFiles(
   return out;
 }
 
-function loadFileTreeMap(db: AgentDB): Map<string, FileEntry> {
-  const rows = db.db.prepare(`SELECT path, hash, size, modified_at, language, indexed_at FROM file_tree`).all() as {
+function loadFileTreeMap(database: import("bun:sqlite").Database): Map<string, FileEntry> {
+  const rows = database.prepare(`SELECT path, hash, size, modified_at, language, indexed_at FROM file_tree`).all() as {
     path: string;
     hash: string;
     size: number | null;
@@ -271,15 +162,35 @@ function fileAppearsChanged(fullPath: string, prev: FileEntry): boolean {
   }
 }
 
-/** Incrementally index text files under repoPath; uses mtime+size for fast skip. */
+/**
+ * Incrementally index text files under repoPath; uses mtime+size for fast skip.
+ * When the AgentDB has a workspace attached, indexing targets the workspace DB.
+ */
 export function indexCodebase(db: AgentDB, repoPath: string, opts?: IndexOptions): IndexResult {
+  const wsHandle = getWorkspaceHandle(db);
+  return indexCodebaseInto(wsHandle, db, repoPath, opts);
+}
+
+/**
+ * Index directly into a WorkspaceDB (no AgentDB needed).
+ */
+export function indexWorkspace(ws: WorkspaceDB, opts?: IndexOptions): IndexResult {
+  return indexCodebaseInto(ws.db, undefined, ws.workspacePath, opts);
+}
+
+function indexCodebaseInto(
+  targetDb: import("bun:sqlite").Database,
+  agentDb: AgentDB | undefined,
+  repoPath: string,
+  opts?: IndexOptions,
+): IndexResult {
   const t0 = Date.now();
   const chunkSize = opts?.chunkSize ?? 1000;
   const chunkOverlap = opts?.chunkOverlap ?? 150;
   const minChunk = 250;
   const force = opts?.forceReindex ?? false;
 
-  const fromDb = getExcludePatterns(db);
+  const fromDb = agentDb ? getExcludePatterns(agentDb) : getExcludePatternsRaw(targetDb);
   const exclude = [...fromDb, ...(opts?.exclude ?? [])];
 
   const gitRules = loadGitRules(repoPath, "");
@@ -290,24 +201,24 @@ export function indexCodebase(db: AgentDB, repoPath: string, opts?: IndexOptions
     throw sqlError("indexCodebase (scan)", e);
   }
 
-  const prevMap = loadFileTreeMap(db);
+  const prevMap = loadFileTreeMap(targetDb);
   const now = Date.now();
   let filesChanged = 0;
   let chunksCreated = 0;
 
-  const deleteChunksStmt = db.db.prepare(`DELETE FROM code_chunks WHERE path = ?`);
-  const insertChunkStmt = db.db.prepare(
+  const deleteChunksStmt = targetDb.prepare(`DELETE FROM code_chunks WHERE path = ?`);
+  const insertChunkStmt = targetDb.prepare(
     `INSERT INTO code_chunks (path, chunk_index, start_line, end_line, language, chunk_text, embedding)
      VALUES (?,?,?,?,?,?,NULL)`,
   );
-  const upsertFileStmt = db.db.prepare(
+  const upsertFileStmt = targetDb.prepare(
     `INSERT OR REPLACE INTO file_tree (path, hash, size, modified_at, language, indexed_at)
      VALUES (?,?,?,?,?,?)`,
   );
-  const deleteFileStmt = db.db.prepare(`DELETE FROM file_tree WHERE path = ?`);
+  const deleteFileStmt = targetDb.prepare(`DELETE FROM file_tree WHERE path = ?`);
 
   const tracked = new Set<string>();
-  const tx = db.db.transaction(() => {
+  const tx = targetDb.transaction(() => {
     for (const rel of files) {
       tracked.add(rel);
       const fullPath = join(repoPath, rel);
@@ -372,13 +283,24 @@ export function indexCodebase(db: AgentDB, repoPath: string, opts?: IndexOptions
   };
 }
 
-export function getIndexStatus(db: AgentDB): IndexStatus {
+/** Read exclude patterns directly from a database handle (for workspace-only use). */
+function getExcludePatternsRaw(database: import("bun:sqlite").Database): string[] {
   try {
-    const totalFilesRow = db.db.prepare(`SELECT COUNT(*) AS c FROM file_tree`).get() as { c: number };
-    const totalChunksRow = db.db.prepare(`SELECT COUNT(*) AS c FROM code_chunks`).get() as { c: number };
-    const lastRow = db.db.prepare(`SELECT MAX(indexed_at) AS m FROM file_tree`).get() as { m: number | null };
-    const pendingRow = db.db.prepare(`SELECT COUNT(*) AS c FROM file_tree WHERE indexed_at IS NULL`).get() as { c: number };
-    const langRows = db.db.prepare(`SELECT language, COUNT(*) AS c FROM code_chunks GROUP BY language`).all() as {
+    const rows = database.prepare(`SELECT pattern FROM exclude_patterns ORDER BY pattern`).all() as { pattern: string }[];
+    return rows.map((r) => r.pattern);
+  } catch {
+    return [];
+  }
+}
+
+export function getIndexStatus(db: AgentDB): IndexStatus {
+  const wsHandle = getWorkspaceHandle(db);
+  try {
+    const totalFilesRow = wsHandle.prepare(`SELECT COUNT(*) AS c FROM file_tree`).get() as { c: number };
+    const totalChunksRow = wsHandle.prepare(`SELECT COUNT(*) AS c FROM code_chunks`).get() as { c: number };
+    const lastRow = wsHandle.prepare(`SELECT MAX(indexed_at) AS m FROM file_tree`).get() as { m: number | null };
+    const pendingRow = wsHandle.prepare(`SELECT COUNT(*) AS c FROM file_tree WHERE indexed_at IS NULL`).get() as { c: number };
+    const langRows = wsHandle.prepare(`SELECT language, COUNT(*) AS c FROM code_chunks GROUP BY language`).all() as {
       language: string | null;
       c: number;
     }[];
@@ -401,6 +323,7 @@ export function getIndexStatus(db: AgentDB): IndexStatus {
 
 /** Diff DB file_tree vs filesystem using mtime+size fast-path before hashing. */
 export function getFileTreeDiff(db: AgentDB, repoPath: string): TreeDiff {
+  const wsHandle = getWorkspaceHandle(db);
   const fromDb = getExcludePatterns(db);
   const gitRules = loadGitRules(repoPath, "");
   let files: string[] = [];
@@ -410,7 +333,7 @@ export function getFileTreeDiff(db: AgentDB, repoPath: string): TreeDiff {
     throw sqlError("getFileTreeDiff", e);
   }
   const disk = new Set(files);
-  const prevMap = loadFileTreeMap(db);
+  const prevMap = loadFileTreeMap(wsHandle);
 
   const added: string[] = [];
   const changed: string[] = [];

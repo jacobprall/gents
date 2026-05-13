@@ -2,7 +2,7 @@ import { hybridSearch } from "@gents/agent-db";
 import { Command } from "commander";
 import * as path from "node:path";
 
-import { cyan, dim } from "../display";
+import { accent, muted } from "../display";
 import { openSession } from "../session";
 
 export const searchCommand = new Command("search")
@@ -34,16 +34,16 @@ export const searchCommand = new Command("search")
       }
 
       for (const r of results) {
-        console.log(
-          `\n  ${cyan(r.path)}:${String(r.startLine)}-${String(r.endLine)} ${dim(`(score: ${r.score.toFixed(2)})`)}`,
+        process.stdout.write(
+          `\n  ${accent(r.path)}:${String(r.startLine)}-${String(r.endLine)} ${muted(`(score: ${r.score.toFixed(2)})`)}\n`,
         );
-        console.log(`  ${"─".repeat(40)}`);
+        process.stdout.write(`  ${muted("─".repeat(40))}\n`);
         const lines = r.chunkText.split("\n");
         for (const line of lines.slice(0, 8)) {
-          console.log(`  ${line}`);
+          process.stdout.write(`  ${line}\n`);
         }
-        if (lines.length > 8) console.log(dim("  ..."));
+        if (lines.length > 8) process.stdout.write(`${muted("  ...")}\n`);
       }
-      if (results.length === 0) console.log(dim("No results."));
+      if (results.length === 0) process.stdout.write(`${muted("  No results.")}\n`);
     },
   );
