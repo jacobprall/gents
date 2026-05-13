@@ -1,9 +1,6 @@
+import { sqlError } from "./errors";
+import { globMatch } from "./glob";
 import type { AgentDB, SearchOptions, SearchResult } from "./types";
-
-function sqlError(op: string, cause: unknown): Error {
-  const msg = cause instanceof Error ? cause.message : String(cause);
-  return new Error(`${op} failed: ${msg}`);
-}
 
 const RRF_K = 60;
 
@@ -23,33 +20,24 @@ function matchesFilters(r: SearchResult, languages?: string[], paths?: string[])
     if (!languages.includes(lang)) return false;
   }
   if (paths != null && paths.length > 0) {
-    const hit = paths.some((p) => globLikeMatch(r.path, p));
+    const hit = paths.some((p) => globMatch(p, r.path));
     if (!hit) return false;
   }
   return true;
 }
 
-/** Minimal glob: supports * and **; always forward-slash. */
-function globLikeMatch(path: string, pattern: string): boolean {
-  const norm = path.replace(/\\/g, "/");
-  const pat = pattern.replace(/\\/g, "/");
-  const esc = pat
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*/g, "\0DS\0")
-    .replace(/\*/g, "[^/]*")
-    .replace(/\0DS\0/g, ".*");
-  const re = new RegExp(`^${esc}$`);
-  return re.test(norm) || re.test(norm.split("/").pop() ?? "");
-}
-
-function probeVectorScan(database: import("bun:sqlite").Database): boolean {
+function probeVectorScan(db: AgentDB): boolean {
+  if (db.vectorAvailable !== undefined) return db.vectorAvailable;
+  let available = false;
   try {
-    const stmt = database.prepare(`SELECT 1 FROM vector_quantize_scan('code_chunks', 'embedding', ?, 1) LIMIT 1`);
+    const stmt = db.db.prepare(`SELECT 1 FROM vector_quantize_scan('code_chunks', 'embedding', ?, 1) LIMIT 1`);
     stmt.get(new Uint8Array(4));
-    return true;
+    available = true;
   } catch {
-    return false;
+    available = false;
   }
+  (db as { vectorAvailable?: boolean }).vectorAvailable = available;
+  return available;
 }
 
 function tryQueryEmbedding(database: import("bun:sqlite").Database, query: string): Uint8Array | null {
@@ -63,13 +51,25 @@ function tryQueryEmbedding(database: import("bun:sqlite").Database, query: strin
   }
 }
 
-interface Bm25Row {
+interface ChunkRow {
   path: string;
   chunk_index: number;
   start_line: number;
   end_line: number;
   language: string | null;
   chunk_text: string;
+}
+
+function rowToResult(r: ChunkRow): SearchResult {
+  return {
+    path: r.path,
+    chunkIndex: r.chunk_index,
+    startLine: r.start_line,
+    endLine: r.end_line,
+    language: r.language,
+    chunkText: r.chunk_text,
+    score: 0,
+  };
 }
 
 function bm25Search(database: import("bun:sqlite").Database, match: string, fetchLimit: number): SearchResult[] {
@@ -84,28 +84,11 @@ function bm25Search(database: import("bun:sqlite").Database, match: string, fetc
          ORDER BY bm25(code_fts)
          LIMIT ?`,
       )
-      .all(match, fetchLimit) as Bm25Row[];
-    return rows.map((r) => ({
-      path: r.path,
-      chunkIndex: r.chunk_index,
-      startLine: r.start_line,
-      endLine: r.end_line,
-      language: r.language,
-      chunkText: r.chunk_text,
-      score: 0,
-    }));
+      .all(match, fetchLimit) as ChunkRow[];
+    return rows.map(rowToResult);
   } catch (e) {
     throw sqlError("hybridSearch (BM25)", e);
   }
-}
-
-interface VecRow {
-  path: string;
-  chunk_index: number;
-  start_line: number;
-  end_line: number;
-  language: string | null;
-  chunk_text: string;
 }
 
 function vectorSearch(database: import("bun:sqlite").Database, embedding: Uint8Array, fetchLimit: number): SearchResult[] {
@@ -116,16 +99,8 @@ function vectorSearch(database: import("bun:sqlite").Database, embedding: Uint8A
        FROM code_chunks AS c
        JOIN vector_quantize_scan('code_chunks', 'embedding', ?, ?) AS v ON c.rowid = v.rowid`,
     )
-    .all(embedding, fetchLimit) as VecRow[];
-  return rows.map((r) => ({
-    path: r.path,
-    chunkIndex: r.chunk_index,
-    startLine: r.start_line,
-    endLine: r.end_line,
-    language: r.language,
-    chunkText: r.chunk_text,
-    score: 0,
-  }));
+    .all(embedding, fetchLimit) as ChunkRow[];
+  return rows.map(rowToResult);
 }
 
 function mergeRrf(
@@ -175,14 +150,13 @@ export function hybridSearch(db: AgentDB, query: string, opts?: SearchOptions): 
 
   const match = ftsMatchExpression(query);
   const bm25Raw = bm25Search(db.db, match, fetchLimit);
-  const bm25List = bm25Raw.filter((r) => matchesFilters(r, opts?.languages, opts?.paths));
 
   let vectorList: SearchResult[] = [];
-  if (probeVectorScan(db.db)) {
+  if (probeVectorScan(db)) {
     const emb = tryQueryEmbedding(db.db, query);
     if (emb) {
       try {
-        vectorList = vectorSearch(db.db, emb, fetchLimit).filter((r) => matchesFilters(r, opts?.languages, opts?.paths));
+        vectorList = vectorSearch(db.db, emb, fetchLimit);
       } catch (e) {
         console.warn(`[gents] vector search failed, falling back to BM25-only: ${e instanceof Error ? e.message : String(e)}`);
       }
@@ -192,8 +166,8 @@ export function hybridSearch(db: AgentDB, query: string, opts?: SearchOptions): 
   if (vectorList.length === 0) {
     const wSum = bm25Weight + vectorWeight;
     const scale = wSum > 0 ? 1 / wSum : 1;
-    return mergeRrf(bm25List, [], bm25Weight * scale, 0, limit, opts?.languages, opts?.paths);
+    return mergeRrf(bm25Raw, [], bm25Weight * scale, 0, limit, opts?.languages, opts?.paths);
   }
 
-  return mergeRrf(bm25List, vectorList, bm25Weight, vectorWeight, limit, opts?.languages, opts?.paths);
+  return mergeRrf(bm25Raw, vectorList, bm25Weight, vectorWeight, limit, opts?.languages, opts?.paths);
 }

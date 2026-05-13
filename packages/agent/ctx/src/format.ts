@@ -1,4 +1,12 @@
-import type { AnthropicContentBlock, AnthropicMessage, AnthropicSystemBlock, ContentBlock } from "./types";
+import type { AnthropicContentBlock, AnthropicMessage, ContentBlock } from "./types";
+
+const LOG_PREFIX = "[@gents/agent-ctx]";
+
+function debugWarn(msg: string, cause?: unknown): void {
+  if (process.env["DEBUG"] || process.env["GENTS_DEBUG"]) {
+    console.debug(LOG_PREFIX, msg, cause ?? "");
+  }
+}
 
 function coerceContent(value: unknown): string {
   if (typeof value === "string") return value;
@@ -6,7 +14,8 @@ function coerceContent(value: unknown): string {
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   try {
     return JSON.stringify(value);
-  } catch {
+  } catch (e) {
+    debugWarn("coerceContent: JSON.stringify failed on non-primitive value", e);
     return "";
   }
 }
@@ -30,7 +39,8 @@ function parseToolCallsJson(toolCalls: string | undefined): AnthropicContentBloc
   let parsed: unknown;
   try {
     parsed = JSON.parse(toolCalls) as unknown;
-  } catch {
+  } catch (e) {
+    debugWarn("parseToolCallsJson: invalid JSON in stored tool_calls", e);
     return [];
   }
   if (!Array.isArray(parsed)) return [];
@@ -39,16 +49,18 @@ function parseToolCallsJson(toolCalls: string | undefined): AnthropicContentBloc
   for (const entry of parsed) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
     const e = entry as Record<string, unknown>;
-    const id = typeof e.id === "string" ? e.id : "";
+    const rawId = typeof e.id === "string" && e.id ? e.id : "";
+
     if (e.type === "tool_use" && typeof e.name === "string") {
       out.push({
         type: "tool_use",
-        id,
+        id: rawId || `call_${out.length}`,
         name: e.name,
         input: parseMaybeJsonRecord(e.input),
       });
       continue;
     }
+
     const fn = e.function;
     if (fn && typeof fn === "object" && !Array.isArray(fn)) {
       const f = fn as Record<string, unknown>;
@@ -59,26 +71,29 @@ function parseToolCallsJson(toolCalls: string | undefined): AnthropicContentBloc
         try {
           const args = JSON.parse(f.arguments) as unknown;
           if (typeof args === "object" && args !== null && !Array.isArray(args)) input = args as Record<string, unknown>;
-        } catch {
+        } catch (e) {
+          debugWarn(`parseToolCallsJson: invalid JSON in function arguments for "${name}"`, e);
           input = {};
         }
       }
-      out.push({ type: "tool_use", id: id || `call_${out.length}`, name, input });
+      out.push({ type: "tool_use", id: rawId || `call_${out.length}`, name, input });
     }
   }
   return out;
 }
 
-/** Convert resolver output into system preamble blocks (no breakpoint here). */
-export function normalizeToBlocks(input: string | ContentBlock[]): AnthropicSystemBlock[] {
+/** Convert resolver output into system preamble blocks. */
+export function normalizeToBlocks(input: string | ContentBlock[]): ContentBlock[] {
   if (typeof input === "string") {
     return input ? [{ type: "text", text: input }] : [];
   }
-  return input.map((b): AnthropicSystemBlock => ({
-    type: "text",
-    text: b.text,
-    ...(b.cache_control ? { cache_control: b.cache_control } : {}),
-  }));
+  return input.map(
+    (b): ContentBlock => ({
+      type: "text",
+      text: b.text,
+      ...(b.cache_control ? { cache_control: b.cache_control } : {}),
+    }),
+  );
 }
 
 interface DbMessageLike {
@@ -89,7 +104,9 @@ interface DbMessageLike {
 }
 
 function isDbMessage(o: unknown): o is DbMessageLike {
-  return typeof o === "object" && o !== null && "role" in o;
+  if (typeof o !== "object" || o === null) return false;
+  const role = (o as Record<string, unknown>).role;
+  return typeof role === "string";
 }
 
 function toolResultBlock(toolUseId: string, content: string): AnthropicContentBlock {
@@ -97,8 +114,8 @@ function toolResultBlock(toolUseId: string, content: string): AnthropicContentBl
   return { type: "tool_result", tool_use_id: id, content };
 }
 
-/** Build assistant Anthropic payload: optional text plus parsed tool_use blocks. */
-function formatAssistantMessage(msg: DbMessageLike): AnthropicMessage {
+/** Build assistant Anthropic payload; returns null for empty messages. */
+function formatAssistantMessage(msg: DbMessageLike): AnthropicMessage | null {
   const pieces: AnthropicContentBlock[] = [];
   const text = coerceContent(msg.content).trim();
   if (text) pieces.push({ type: "text", text });
@@ -107,13 +124,42 @@ function formatAssistantMessage(msg: DbMessageLike): AnthropicMessage {
   if (typeof msg.toolCalls === "string") toolCallsJson = msg.toolCalls;
   pieces.push(...parseToolCallsJson(toolCallsJson));
 
-  if (pieces.length === 0) return { role: "assistant", content: "" };
+  if (pieces.length === 0) return null;
 
   if (pieces.length === 1) {
     const only = pieces[0]!;
     if (only.type === "text") return { role: "assistant", content: only.text };
   }
   return { role: "assistant", content: pieces };
+}
+
+function contentToBlocks(content: string | AnthropicContentBlock[]): AnthropicContentBlock[] {
+  if (typeof content === "string") {
+    return content ? [{ type: "text", text: content }] : [];
+  }
+  return content;
+}
+
+/** Merge consecutive same-role messages to satisfy the Anthropic alternation requirement. */
+function coalesceMessages(messages: AnthropicMessage[]): AnthropicMessage[] {
+  if (messages.length <= 1) return messages;
+  const out: AnthropicMessage[] = [messages[0]!];
+
+  for (let i = 1; i < messages.length; i++) {
+    const prev = out[out.length - 1]!;
+    const curr = messages[i]!;
+
+    if (prev.role !== curr.role) {
+      out.push(curr);
+      continue;
+    }
+
+    const prevBlocks = contentToBlocks(prev.content);
+    const currBlocks = contentToBlocks(curr.content);
+    prev.content = [...prevBlocks, ...currBlocks];
+  }
+
+  return out;
 }
 
 /** Map stored conversation rows to Anthropic `messages`. */
@@ -133,7 +179,8 @@ export function formatConversation(raw: unknown): AnthropicMessage[] {
       continue;
     }
     if (role === "assistant") {
-      out.push(formatAssistantMessage(item));
+      const formatted = formatAssistantMessage(item);
+      if (formatted) out.push(formatted);
       continue;
     }
     if (role === "tool") {
@@ -155,5 +202,5 @@ export function formatConversation(raw: unknown): AnthropicMessage[] {
     }
   }
 
-  return out;
+  return coalesceMessages(out);
 }

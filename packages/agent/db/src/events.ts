@@ -1,24 +1,28 @@
+import { sqlError } from "./errors";
 import type { AgentDB, Event, NewEvent } from "./types";
 import { generateUUIDv7 } from "./uuid";
 
-function sqlError(op: string, cause: unknown): Error {
-  const msg = cause instanceof Error ? cause.message : String(cause);
-  return new Error(`${op} failed: ${msg}`);
+interface EventRow {
+  id: string;
+  type: string;
+  payload: string;
+  turn: number | null;
+  created_at: number;
 }
 
-function rowToEvent(row: Record<string, unknown>): Event {
+function rowToEvent(row: EventRow): Event {
   let payload: Record<string, unknown>;
   try {
-    payload = JSON.parse(String(row.payload)) as Record<string, unknown>;
+    payload = JSON.parse(row.payload) as Record<string, unknown>;
   } catch {
     payload = {};
   }
   return {
-    id: String(row.id),
-    type: String(row.type),
+    id: row.id,
+    type: row.type,
     payload,
-    turn: row.turn != null ? Number(row.turn) : undefined,
-    createdAt: Number(row.created_at),
+    turn: row.turn ?? undefined,
+    createdAt: row.created_at,
   };
 }
 
@@ -52,20 +56,20 @@ export function getEvents(
   opts?: { type?: string; limit?: number; offset?: number },
 ): Event[] {
   try {
-    const limit = opts?.limit ?? 100;
-    const offset = opts?.offset ?? 0;
+    const limit = Math.max(1, opts?.limit ?? 100);
+    const offset = Math.max(0, opts?.offset ?? 0);
     if (opts?.type != null) {
-      return db.db
-        .prepare(
-          `SELECT * FROM events WHERE type = ? ORDER BY created_at ASC LIMIT ? OFFSET ?`,
-        )
-        .all(opts.type, limit, offset)
-        .map((r) => rowToEvent(r as Record<string, unknown>));
+      return (
+        db.db
+          .prepare(`SELECT id, type, payload, turn, created_at FROM events WHERE type = ? ORDER BY created_at ASC LIMIT ? OFFSET ?`)
+          .all(opts.type, limit, offset) as EventRow[]
+      ).map(rowToEvent);
     }
-    return db.db
-      .prepare(`SELECT * FROM events ORDER BY created_at ASC LIMIT ? OFFSET ?`)
-      .all(limit, offset)
-      .map((r) => rowToEvent(r as Record<string, unknown>));
+    return (
+      db.db
+        .prepare(`SELECT id, type, payload, turn, created_at FROM events ORDER BY created_at ASC LIMIT ? OFFSET ?`)
+        .all(limit, offset) as EventRow[]
+    ).map(rowToEvent);
   } catch (e) {
     throw sqlError("getEvents", e);
   }
@@ -73,9 +77,9 @@ export function getEvents(
 
 export function getLastEvent(db: AgentDB): Event | undefined {
   try {
-    const row = db.db.prepare(`SELECT * FROM events ORDER BY created_at DESC LIMIT 1`).get() as
-      | Record<string, unknown>
-      | undefined;
+    const row = db.db
+      .prepare(`SELECT id, type, payload, turn, created_at FROM events ORDER BY created_at DESC LIMIT 1`)
+      .get() as EventRow | undefined;
     return row ? rowToEvent(row) : undefined;
   } catch (e) {
     throw sqlError("getLastEvent", e);

@@ -1,6 +1,9 @@
-export type { OtelConfig } from "./types";
+export type { OtelConfig, SpanHandle } from "./types";
 export {
+  TelemetryService,
   initTelemetry,
+  shutdownTelemetry,
+  resetTelemetry,
   traced,
   tracedAsync,
   withSpan,

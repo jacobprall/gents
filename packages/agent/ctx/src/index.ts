@@ -7,8 +7,11 @@ export type {
   AssembleResult,
   AssemblyContext,
   ContentBlock,
+  ConversationResolver,
+  MaybePromise,
   Prompt,
   PromptConfig,
   Section,
+  SectionWithPriority,
 } from "./types";
 export { formatConversation, normalizeToBlocks } from "./format";

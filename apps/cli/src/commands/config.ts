@@ -1,17 +1,12 @@
 import { Command } from "commander";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 
-import { invalidateGlobalConfigCache } from "../config";
+import { globalConfigPath, invalidateGlobalConfigCache } from "../config";
 import { printError } from "../display";
 
-function configPath(): string {
-  return path.join(homedir(), ".gents", "config.json");
-}
-
 function readAll(): Record<string, unknown> {
-  const p = configPath();
+  const p = globalConfigPath();
   if (!existsSync(p)) return {};
   try {
     const parsed = JSON.parse(readFileSync(p, "utf8")) as unknown;
@@ -25,9 +20,14 @@ function readAll(): Record<string, unknown> {
 }
 
 function writeAll(data: Record<string, unknown>): void {
-  const p = configPath();
+  const p = globalConfigPath();
   mkdirSync(path.dirname(p), { recursive: true });
-  writeFileSync(p, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+  writeFileSync(p, `${JSON.stringify(data, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  try {
+    chmodSync(p, 0o600);
+  } catch {
+    /* best-effort on platforms where chmod may not apply */
+  }
   invalidateGlobalConfigCache();
 }
 
@@ -76,7 +76,7 @@ configCommand
   .command("reset")
   .description("Remove the global config file")
   .action(() => {
-    const p = configPath();
+    const p = globalConfigPath();
     if (existsSync(p)) unlinkSync(p);
     invalidateGlobalConfigCache();
   });

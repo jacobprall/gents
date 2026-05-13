@@ -1,88 +1,32 @@
 import { statSync, readFileSync, readdirSync, existsSync, lstatSync } from "node:fs";
 import { join, relative, normalize } from "node:path";
+import { sqlError } from "./errors";
 import type { AgentDB, FileEntry, IndexOptions, IndexResult, IndexStatus, TreeDiff } from "./types";
 import { getExcludePatterns } from "./file-tree";
 
-function sqlError(op: string, cause: unknown): Error {
-  const msg = cause instanceof Error ? cause.message : String(cause);
-  return new Error(`${op} failed: ${msg}`);
-}
-
 const BINARY_EXTENSIONS = new Set([
-  "png",
-  "jpg",
-  "jpeg",
-  "gif",
-  "webp",
-  "ico",
-  "bmp",
-  "tif",
-  "tiff",
-  "pdf",
-  "zip",
-  "gz",
-  "tgz",
-  "bz2",
-  "xz",
-  "7z",
-  "rar",
-  "woff",
-  "woff2",
-  "ttf",
-  "otf",
-  "eot",
-  "mp3",
-  "mp4",
-  "wav",
-  "webm",
-  "mov",
-  "avi",
-  "mkv",
-  "exe",
-  "dll",
-  "so",
-  "dylib",
-  "bin",
-  "o",
-  "a",
-  "class",
-  "jar",
-  "wasm",
-  "sqlite",
-  "db",
-  "parquet",
-  "gifv",
+  "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "tif", "tiff",
+  "pdf", "zip", "gz", "tgz", "bz2", "xz", "7z", "rar",
+  "woff", "woff2", "ttf", "otf", "eot",
+  "mp3", "mp4", "wav", "webm", "mov", "avi", "mkv",
+  "exe", "dll", "so", "dylib", "bin", "o", "a",
+  "class", "jar", "wasm", "sqlite", "db", "parquet", "gifv",
 ]);
 
-/** Glob-like match for ignore patterns (slash-normalized). */
-function pathMatchesPattern(target: string, pattern: string): boolean {
-  const norm = target.replace(/\\/g, "/").replace(/^\/+/, "");
-  const pat = pattern.replace(/\\/g, "/").replace(/^\/+/, "");
-  if (!pat.includes("*") && !pat.includes("?")) {
-    return norm === pat || norm.startsWith(`${pat}/`) || norm.endsWith(`/${pat}`) || norm.includes(`/${pat}/`);
-  }
-  const esc = pat
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*/g, "\0DS\0")
-    .replace(/\*/g, "[^/]*")
-    .replace(/\?/g, "[^/]")
-    .replace(/\0DS\0/g, ".*");
-  const re = new RegExp(`^(?:${esc})$|^(?:${esc})/|/(?:${esc})$|/(?:${esc})/`);
-  return re.test(norm) || new RegExp(`^${esc}$`).test(norm.split("/").pop() ?? "");
-}
+import { globMatch } from "./glob";
+
+// --- Gitignore handling (supports nested .gitignore files) ---
 
 interface GitRule {
   pattern: string;
   negated: boolean;
   dirOnly: boolean;
+  basePath: string;
 }
 
-function loadGitRules(repoPath: string): GitRule[] {
-  const p = join(repoPath, ".gitignore");
-  if (!existsSync(p)) return [];
-  const raw = readFileSync(p, "utf8");
+function parseGitignoreLines(content: string, basePath: string): GitRule[] {
   const rules: GitRule[] = [];
-  for (let line of raw.split("\n")) {
+  for (let line of content.split("\n")) {
     line = line.replace(/\r$/, "").trim();
     if (!line || line.startsWith("#")) continue;
     let negated = false;
@@ -92,9 +36,20 @@ function loadGitRules(repoPath: string): GitRule[] {
     }
     let dirOnly = line.endsWith("/");
     if (dirOnly) line = line.slice(0, -1);
-    if (line) rules.push({ pattern: line, negated, dirOnly });
+    if (line) rules.push({ pattern: line, negated, dirOnly, basePath });
   }
   return rules;
+}
+
+function loadGitRules(dirPath: string, basePath: string): GitRule[] {
+  const p = join(dirPath, ".gitignore");
+  if (!existsSync(p)) return [];
+  try {
+    const raw = readFileSync(p, "utf8");
+    return parseGitignoreLines(raw, basePath);
+  } catch {
+    return [];
+  }
 }
 
 function gitIgnored(rel: string, isDir: boolean, rules: GitRule[]): boolean {
@@ -102,69 +57,40 @@ function gitIgnored(rel: string, isDir: boolean, rules: GitRule[]): boolean {
   const norm = rel.replace(/\\/g, "/");
   for (const r of rules) {
     if (r.dirOnly && !isDir) continue;
-    if (pathMatchesPattern(norm, r.pattern)) {
+    const target = r.basePath ? (norm.startsWith(r.basePath + "/") ? norm.slice(r.basePath.length + 1) : norm) : norm;
+    if (globMatch(r.pattern, target)) {
       ignored = !r.negated;
     }
   }
   return ignored;
 }
 
+// --- Language detection ---
+
+const LANGUAGE_MAP: Record<string, string> = {
+  ts: "typescript", tsx: "typescript", mts: "typescript", cts: "typescript",
+  js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript",
+  py: "python", pyi: "python",
+  rs: "rust", go: "go", java: "java",
+  kt: "kotlin", kts: "kotlin",
+  c: "c", h: "c",
+  cc: "cpp", cpp: "cpp", cxx: "cpp", hpp: "cpp", hh: "cpp",
+  rb: "ruby",
+  md: "markdown", mdx: "markdown",
+  json: "json", yaml: "yaml", yml: "yaml", toml: "toml", xml: "xml",
+  html: "html", css: "css", scss: "scss", sql: "sql",
+  sh: "shell", bash: "shell", zsh: "shell",
+  swift: "swift", scala: "scala", dart: "dart", lua: "lua",
+  ex: "elixir", exs: "elixir",
+  hs: "haskell", cs: "csharp", fs: "fsharp", vb: "vb", php: "php",
+};
+
 function languageFromExt(filePath: string): string | null {
   const base = filePath.split("/").pop() ?? filePath;
   const dot = base.lastIndexOf(".");
   if (dot <= 0) return null;
   const ext = base.slice(dot + 1).toLowerCase();
-  const map: Record<string, string> = {
-    ts: "typescript",
-    tsx: "typescript",
-    mts: "typescript",
-    cts: "typescript",
-    js: "javascript",
-    jsx: "javascript",
-    mjs: "javascript",
-    cjs: "javascript",
-    py: "python",
-    pyi: "python",
-    rs: "rust",
-    go: "go",
-    java: "java",
-    kt: "kotlin",
-    kts: "kotlin",
-    c: "c",
-    h: "c",
-    cc: "cpp",
-    cpp: "cpp",
-    cxx: "cpp",
-    hpp: "cpp",
-    hh: "cpp",
-    rb: "ruby",
-    md: "markdown",
-    mdx: "markdown",
-    json: "json",
-    yaml: "yaml",
-    yml: "yaml",
-    toml: "toml",
-    xml: "xml",
-    html: "html",
-    css: "css",
-    scss: "scss",
-    sql: "sql",
-    sh: "shell",
-    bash: "shell",
-    zsh: "shell",
-    swift: "swift",
-    scala: "scala",
-    dart: "dart",
-    lua: "lua",
-    ex: "elixir",
-    exs: "elixir",
-    hs: "haskell",
-    cs: "csharp",
-    fs: "fsharp",
-    vb: "vb",
-    php: "php",
-  };
-  return map[ext] ?? null;
+  return LANGUAGE_MAP[ext] ?? null;
 }
 
 function isBinaryPath(rel: string): boolean {
@@ -181,66 +107,82 @@ function sha256Hex(data: string | Uint8Array): string {
   return h.digest("hex");
 }
 
+// --- Chunking with accurate line tracking ---
+
 interface ChunkPart {
   text: string;
   startLine: number;
   endLine: number;
 }
 
-/** Split on blank lines first, then subdivide long blocks by line with overlap. */
+/**
+ * Split on double-newline boundaries then subdivide long blocks with overlap.
+ * Tracks actual newlines consumed (including multiple blank lines) to keep line numbers accurate.
+ */
 function chunkFileContent(content: string, chunkSize: number, overlap: number, minChunk: number): ChunkPart[] {
   const normalized = content.replace(/\r\n/g, "\n");
   if (!normalized.trim()) return [];
 
-  const paragraphs = normalized.split(/\n\n+/);
+  const lines = normalized.split("\n");
+  const totalLines = lines.length;
   const result: ChunkPart[] = [];
-  let lineCursor = 1;
 
-  for (let pi = 0; pi < paragraphs.length; pi++) {
-    const para = paragraphs[pi]!;
-    const paraLines = para.split("\n");
-    const blockStart = lineCursor;
-    lineCursor += paraLines.length + (pi < paragraphs.length - 1 ? 1 : 0);
+  let i = 0;
+  while (i < totalLines) {
+    while (i < totalLines && lines[i]!.trim() === "") i++;
+    if (i >= totalLines) break;
 
-    if (para.length <= chunkSize) {
-      const t = para.trim();
+    const blockStart = i;
+    while (i < totalLines && !(i > blockStart && lines[i]!.trim() === "" && (i + 1 >= totalLines || lines[i + 1]!.trim() === ""))) {
+      i++;
+    }
+    const blockEnd = i;
+
+    const blockLines = lines.slice(blockStart, blockEnd);
+    const blockText = blockLines.join("\n");
+
+    if (blockText.length <= chunkSize) {
+      const t = blockText.trim();
       if (t && (t.length >= minChunk || result.length === 0)) {
-        result.push({ text: t, startLine: blockStart, endLine: blockStart + paraLines.length - 1 });
+        result.push({ text: t, startLine: blockStart + 1, endLine: blockEnd });
       } else if (t && result.length > 0) {
         const prev = result[result.length - 1]!;
         prev.text = `${prev.text}\n\n${t}`;
-        prev.endLine = blockStart + paraLines.length - 1;
+        prev.endLine = blockEnd;
       }
-      continue;
+    } else {
+      let li = 0;
+      while (li < blockLines.length) {
+        let accLen = 0;
+        let lj = li;
+        while (lj < blockLines.length && accLen < chunkSize) {
+          accLen += blockLines[lj]!.length + (lj > li ? 1 : 0);
+          lj++;
+        }
+        if (lj === li) lj = li + 1;
+        const slice = blockLines.slice(li, lj).join("\n").trim();
+        if (slice) {
+          if (slice.length >= minChunk || result.length === 0) {
+            result.push({ text: slice, startLine: blockStart + li + 1, endLine: blockStart + lj });
+          } else {
+            const prev = result[result.length - 1]!;
+            prev.text = `${prev.text}\n\n${slice}`;
+            prev.endLine = blockStart + lj;
+          }
+        }
+        if (lj >= blockLines.length) break;
+        const overlapLines = Math.max(1, Math.ceil(overlap / 80));
+        li = Math.max(li + 1, lj - overlapLines);
+      }
     }
 
-    let i = 0;
-    while (i < paraLines.length) {
-      let accLen = 0;
-      let j = i;
-      while (j < paraLines.length && accLen < chunkSize) {
-        accLen += paraLines[j]!.length + (j > i ? 1 : 0);
-        j++;
-      }
-      if (j === i) j = i + 1;
-      const slice = paraLines.slice(i, j).join("\n").trim();
-      if (slice) {
-        if (slice.length >= minChunk || result.length === 0) {
-          result.push({ text: slice, startLine: blockStart + i, endLine: blockStart + j - 1 });
-        } else {
-          const prev = result[result.length - 1]!;
-          prev.text = `${prev.text}\n\n${slice}`;
-          prev.endLine = blockStart + j - 1;
-        }
-      }
-      if (j >= paraLines.length) break;
-      const overlapLines = Math.max(1, Math.ceil(overlap / 80));
-      i = Math.max(i + 1, j - overlapLines);
-    }
+    while (i < totalLines && lines[i]!.trim() === "") i++;
   }
 
   return result;
 }
+
+// --- File walking ---
 
 function listSourceFiles(
   repoPath: string,
@@ -251,16 +193,20 @@ function listSourceFiles(
   const out: string[] = [];
   const normRoot = normalize(repoPath);
 
-  const walk = (dir: string) => {
+  const walk = (dir: string, rules: GitRule[]) => {
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
     } catch {
       return;
     }
+
+    const rel = relative(normRoot, dir).replace(/\\/g, "/");
+    const localRules = [...rules, ...loadGitRules(dir, rel)];
+
     for (const e of entries) {
       const full = join(dir, e.name);
-      const rel = relative(normRoot, full).replace(/\\/g, "/");
+      const entryRel = relative(normRoot, full).replace(/\\/g, "/");
       try {
         if (lstatSync(full).isSymbolicLink()) continue;
       } catch {
@@ -268,24 +214,25 @@ function listSourceFiles(
       }
       if (e.isDirectory()) {
         if (e.name === ".git") continue;
-        if (exclude.some((p) => pathMatchesPattern(rel, p) || pathMatchesPattern(`${rel}/`, p))) continue;
-        if (gitIgnored(rel, true, gitRules)) continue;
-        walk(full);
+        if (exclude.some((p) => globMatch(p, entryRel) || globMatch(p, `${entryRel}/`))) continue;
+        if (gitIgnored(entryRel, true, localRules)) continue;
+        walk(full, localRules);
       } else if (e.isFile()) {
         if (e.name === ".gitignore") continue;
-        if (isBinaryPath(rel)) continue;
-        if (exclude.some((p) => pathMatchesPattern(rel, p))) continue;
-        if (gitIgnored(rel, false, gitRules)) continue;
+        if (isBinaryPath(entryRel)) continue;
+        if (exclude.some((p) => globMatch(p, entryRel))) continue;
+        if (gitIgnored(entryRel, false, localRules)) continue;
         if (include != null && include.length > 0) {
-          const ok = include.some((p) => pathMatchesPattern(rel, p));
+          const ok = include.some((p) => globMatch(p, entryRel));
           if (!ok) continue;
         }
-        out.push(rel);
+        out.push(entryRel);
       }
     }
   };
 
-  walk(normRoot);
+  const rootRules = loadGitRules(normRoot, "");
+  walk(normRoot, [...gitRules, ...rootRules]);
   return out;
 }
 
@@ -312,7 +259,19 @@ function loadFileTreeMap(db: AgentDB): Map<string, FileEntry> {
   return m;
 }
 
-/** Incrementally index text files under repoPath; embeddings are not written (extension-dependent). */
+/** Check if file likely changed using mtime+size before expensive hash. */
+function fileAppearsChanged(fullPath: string, prev: FileEntry): boolean {
+  try {
+    const st = statSync(fullPath);
+    if (prev.size != null && st.size !== prev.size) return true;
+    if (prev.modifiedAt != null && Math.trunc(st.mtimeMs) !== prev.modifiedAt) return true;
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/** Incrementally index text files under repoPath; uses mtime+size for fast skip. */
 export function indexCodebase(db: AgentDB, repoPath: string, opts?: IndexOptions): IndexResult {
   const t0 = Date.now();
   const chunkSize = opts?.chunkSize ?? 1000;
@@ -323,7 +282,7 @@ export function indexCodebase(db: AgentDB, repoPath: string, opts?: IndexOptions
   const fromDb = getExcludePatterns(db);
   const exclude = [...fromDb, ...(opts?.exclude ?? [])];
 
-  const gitRules = loadGitRules(repoPath);
+  const gitRules = loadGitRules(repoPath, "");
   let files: string[] = [];
   try {
     files = listSourceFiles(repoPath, exclude, opts?.include, gitRules);
@@ -351,23 +310,28 @@ export function indexCodebase(db: AgentDB, repoPath: string, opts?: IndexOptions
   const tx = db.db.transaction(() => {
     for (const rel of files) {
       tracked.add(rel);
+      const fullPath = join(repoPath, rel);
+      const prev = prevMap.get(rel);
+
+      if (!force && prev) {
+        if (!fileAppearsChanged(fullPath, prev)) continue;
+      }
+
       let content: string;
       try {
-        content = readFileSync(join(repoPath, rel), "utf8");
+        content = readFileSync(fullPath, "utf8");
       } catch {
         continue;
       }
-      const st = (() => {
-        try {
-          return statSync(join(repoPath, rel));
-        } catch {
-          return null;
-        }
-      })();
+
       const hash = sha256Hex(content);
-      const prev = prevMap.get(rel);
-      const changed = force || !prev || prev.hash !== hash;
-      if (!changed) continue;
+      if (!force && prev && prev.hash === hash) {
+        const st = (() => { try { return statSync(fullPath); } catch { return null; } })();
+        if (st) {
+          upsertFileStmt.run(rel, hash, st.size, Math.trunc(st.mtimeMs), prev.language, prev.indexedAt);
+        }
+        continue;
+      }
 
       filesChanged++;
       deleteChunksStmt.run(rel);
@@ -380,6 +344,7 @@ export function indexCodebase(db: AgentDB, repoPath: string, opts?: IndexOptions
         chunksCreated++;
       }
 
+      const st = (() => { try { return statSync(fullPath); } catch { return null; } })();
       upsertFileStmt.run(rel, hash, st?.size ?? content.length, st != null ? Math.trunc(st.mtimeMs) : null, lang, now);
     }
 
@@ -407,7 +372,6 @@ export function indexCodebase(db: AgentDB, repoPath: string, opts?: IndexOptions
   };
 }
 
-/** Aggregate index metadata for dashboards. */
 export function getIndexStatus(db: AgentDB): IndexStatus {
   try {
     const totalFilesRow = db.db.prepare(`SELECT COUNT(*) AS c FROM file_tree`).get() as { c: number };
@@ -435,10 +399,10 @@ export function getIndexStatus(db: AgentDB): IndexStatus {
   }
 }
 
-/** Diff DB file_tree vs filesystem without mutating the database. */
+/** Diff DB file_tree vs filesystem using mtime+size fast-path before hashing. */
 export function getFileTreeDiff(db: AgentDB, repoPath: string): TreeDiff {
   const fromDb = getExcludePatterns(db);
-  const gitRules = loadGitRules(repoPath);
+  const gitRules = loadGitRules(repoPath, "");
   let files: string[] = [];
   try {
     files = listSourceFiles(repoPath, fromDb, undefined, gitRules);
@@ -453,16 +417,21 @@ export function getFileTreeDiff(db: AgentDB, repoPath: string): TreeDiff {
   const removed: string[] = [];
 
   for (const p of disk) {
+    const prev = prevMap.get(p);
+    if (!prev) {
+      added.push(p);
+      continue;
+    }
+    const fullPath = join(repoPath, p);
+    if (!fileAppearsChanged(fullPath, prev)) continue;
     let content: string;
     try {
-      content = readFileSync(join(repoPath, p), "utf8");
+      content = readFileSync(fullPath, "utf8");
     } catch {
       continue;
     }
     const hash = sha256Hex(content);
-    const prev = prevMap.get(p);
-    if (!prev) added.push(p);
-    else if (prev.hash !== hash) changed.push(p);
+    if (prev.hash !== hash) changed.push(p);
   }
   for (const p of prevMap.keys()) {
     if (!disk.has(p)) removed.push(p);

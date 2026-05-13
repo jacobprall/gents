@@ -9,11 +9,27 @@ import {
   type AgentDB,
 } from "@gents/agent-db";
 import type { HookContext } from "@gents/agent-hooks";
-import { recordCost, recordTokenUsage, recordToolCall } from "@gents/agent-otel";
+import { recordCost, recordTokenUsage } from "@gents/agent-otel";
 import type { ToolContext } from "@gents/agent-tools";
 import { streamCompletion } from "./anthropic";
 import { calculateCost } from "./cost";
-import type { AgentLoop, AssistantMessage, LoopConfig, LoopEvent, ToolCallInfo } from "./types";
+import {
+  executeToolsParallel,
+  executeToolsSequential,
+  type ToolExecutorConfig,
+} from "./tool-executor";
+import {
+  CostLimitError,
+  DEFAULT_MAX_ITERATIONS,
+  DEFAULT_MAX_TOOL_OUTPUT_BYTES,
+  HookRejectionError,
+  LoopError,
+  type AgentLoop,
+  type AssistantMessage,
+  type LoopConfig,
+  type LoopEvent,
+  type ToolCallInfo,
+} from "./types";
 
 function serializeToolCalls(calls: ToolCallInfo[]): string {
   return JSON.stringify(
@@ -26,42 +42,97 @@ function serializeToolCalls(calls: ToolCallInfo[]): string {
   );
 }
 
+function makeHookCtx(base: {
+  sessionCostUsd: number;
+  turnCostUsd: number;
+  turn: number;
+  model: string;
+  tokensIn?: number;
+  tokensOut?: number;
+}): HookContext {
+  return {
+    sessionCostUsd: base.sessionCostUsd,
+    turnCostUsd: base.turnCostUsd,
+    turnNumber: base.turn,
+    model: base.model,
+    tokensIn: base.tokensIn ?? 0,
+    tokensOut: base.tokensOut ?? 0,
+  };
+}
+
+function extractTransformed(result: { action: string; transformed?: unknown }): string | undefined {
+  if (result.action === "continue" && "transformed" in result && typeof result.transformed === "string") {
+    return result.transformed;
+  }
+  return undefined;
+}
+
 export function createAgentLoop(config: LoopConfig): AgentLoop {
   const workingDir = config.workingDir ?? config.repoPath;
-  const maxIter = config.maxIterations ?? 25;
+  const maxIter = config.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+  const maxToolOutput = config.maxToolOutputBytes ?? DEFAULT_MAX_TOOL_OUTPUT_BYTES;
+
+  const client = new Anthropic({ apiKey: config.apiKey });
 
   const notify = (e: LoopEvent): LoopEvent => {
     config.onEvent?.(e);
     return e;
   };
 
-  async function* runAfterUserMessage(db: AgentDB, client: Anthropic, turn: number): AsyncGenerator<LoopEvent> {
+  const toolExecConfig: ToolExecutorConfig = {
+    hooks: config.hooks,
+    tools: config.tools,
+    maxToolOutputBytes: maxToolOutput,
+    signal: config.signal,
+    onEvent: notify,
+  };
+
+  async function* runAfterUserMessage(db: AgentDB, turn: number): AsyncGenerator<LoopEvent> {
     let sessionCostUsd = getSessionMetrics(db).totalCostUsd;
+    let turnCostUsd = 0;
     let iteration = 0;
 
     while (iteration < maxIter) {
       iteration++;
 
-      let assembled;
-      try {
-        assembled = config.ctx.assemble(db, { currentTurn: turn });
-      } catch (e) {
-        yield notify({ type: "error", error: e instanceof Error ? e : new Error(String(e)) });
+      if (config.signal?.aborted) {
+        yield notify({ type: "error", error: new LoopError("Aborted", "aborted") });
         return;
       }
 
-      const hookCtx: HookContext = {
-        sessionCostUsd,
-        turnCostUsd: 0,
-        turnNumber: turn,
-        model: config.model,
-        tokensIn: 0,
-        tokensOut: 0,
-      };
+      let assembled;
+      try {
+        assembled = await config.ctx.assemble(db, { currentTurn: turn });
+      } catch (e) {
+        yield notify({
+          type: "error",
+          error: new LoopError(
+            `Context assembly failed: ${e instanceof Error ? e.message : String(e)}`,
+            "context_assembly_error",
+          ),
+        });
+        return;
+      }
 
-      const preResult = await config.hooks.runPreLLM(hookCtx);
+      if (config.maxCostPerSession != null && sessionCostUsd >= config.maxCostPerSession) {
+        const err = new CostLimitError(
+          `Session cost $${sessionCostUsd.toFixed(6)} already at/above maxCostPerSession ($${config.maxCostPerSession})`,
+          "session",
+          sessionCostUsd,
+          config.maxCostPerSession,
+        );
+        yield notify({ type: "paused", reason: err.message });
+        appendEvent(db, { type: "turn.paused", payload: { reason: err.message }, turn });
+        return;
+      }
+
+      const preHookCtx = makeHookCtx({ sessionCostUsd, turnCostUsd, turn, model: config.model });
+      const preResult = await config.hooks.runPreLLM(preHookCtx);
       if (preResult.action === "reject") {
-        yield notify({ type: "error", error: new Error(preResult.reason) });
+        yield notify({
+          type: "error",
+          error: new HookRejectionError(`Pre-LLM hook rejected: ${preResult.reason}`, "pre_llm", preResult.reason),
+        });
         return;
       }
       if (preResult.action === "pause") {
@@ -79,6 +150,8 @@ export function createAgentLoop(config: LoopConfig): AgentLoop {
           system: assembled.system,
           messages: assembled.messages,
           tools: assembled.tools,
+          maxTokens: config.maxTokens,
+          signal: config.signal,
         })) {
           if (event.type === "text_delta") {
             yield notify({ type: "llm.streaming", delta: event.text });
@@ -88,29 +161,40 @@ export function createAgentLoop(config: LoopConfig): AgentLoop {
           }
         }
       } catch (e) {
-        const err = e instanceof Error ? e : new Error(String(e));
-        yield notify({ type: "error", error: err });
+        const msg = e instanceof Error ? e.message : String(e);
+        yield notify({ type: "error", error: new LoopError(`LLM API error: ${msg}`, "llm_api_error") });
         return;
       }
 
       if (!assistantMsg || !usage) {
-        yield notify({ type: "error", error: new Error("LLM returned no response") });
+        yield notify({ type: "error", error: new LoopError("LLM returned no response", "llm_empty_response") });
         return;
       }
 
-      let turnCostUsd = calculateCost(config.model, usage);
-      sessionCostUsd += turnCostUsd;
+      const iterationCost = calculateCost(config.model, usage);
+      turnCostUsd += iterationCost;
+      sessionCostUsd += iterationCost;
 
       if (config.maxCostPerTurn != null && turnCostUsd >= config.maxCostPerTurn) {
-        const reason = `Turn cost $${turnCostUsd.toFixed(6)} exceeds maxCostPerTurn ($${config.maxCostPerTurn})`;
-        yield notify({ type: "paused", reason });
-        appendEvent(db, { type: "turn.paused", payload: { reason }, turn });
+        const err = new CostLimitError(
+          `Turn cost $${turnCostUsd.toFixed(6)} exceeds maxCostPerTurn ($${config.maxCostPerTurn})`,
+          "turn",
+          turnCostUsd,
+          config.maxCostPerTurn,
+        );
+        yield notify({ type: "paused", reason: err.message });
+        appendEvent(db, { type: "turn.paused", payload: { reason: err.message }, turn });
         return;
       }
       if (config.maxCostPerSession != null && sessionCostUsd >= config.maxCostPerSession) {
-        const reason = `Session cost $${sessionCostUsd.toFixed(6)} exceeds maxCostPerSession ($${config.maxCostPerSession})`;
-        yield notify({ type: "paused", reason });
-        appendEvent(db, { type: "turn.paused", payload: { reason }, turn });
+        const err = new CostLimitError(
+          `Session cost $${sessionCostUsd.toFixed(6)} exceeds maxCostPerSession ($${config.maxCostPerSession})`,
+          "session",
+          sessionCostUsd,
+          config.maxCostPerSession,
+        );
+        yield notify({ type: "paused", reason: err.message });
+        appendEvent(db, { type: "turn.paused", payload: { reason: err.message }, turn });
         return;
       }
 
@@ -120,7 +204,7 @@ export function createAgentLoop(config: LoopConfig): AgentLoop {
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
         cachedInputTokens: usage.cacheReadInputTokens ?? 0,
-        costUsd: turnCostUsd,
+        costUsd: iterationCost,
         toolCalls: assistantMsg.toolCalls.length,
       });
 
@@ -130,7 +214,7 @@ export function createAgentLoop(config: LoopConfig): AgentLoop {
           model: config.model,
           inputTokens: usage.inputTokens,
           outputTokens: usage.outputTokens,
-          costUsd: turnCostUsd,
+          costUsd: iterationCost,
         },
         turn,
       });
@@ -138,16 +222,23 @@ export function createAgentLoop(config: LoopConfig): AgentLoop {
       yield notify({ type: "llm.complete", message: assistantMsg, usage });
 
       recordTokenUsage(config.model, usage.inputTokens, usage.outputTokens);
-      recordCost(config.model, turnCostUsd);
+      recordCost(config.model, iterationCost);
 
-      hookCtx.turnCostUsd = turnCostUsd;
-      hookCtx.sessionCostUsd = sessionCostUsd;
-      hookCtx.tokensIn = usage.inputTokens;
-      hookCtx.tokensOut = usage.outputTokens;
+      const postHookCtx = makeHookCtx({
+        sessionCostUsd,
+        turnCostUsd,
+        turn,
+        model: config.model,
+        tokensIn: usage.inputTokens,
+        tokensOut: usage.outputTokens,
+      });
 
-      const postResult = await config.hooks.runPostLLM(hookCtx, assistantMsg.content ?? "");
+      const postResult = await config.hooks.runPostLLM(postHookCtx, assistantMsg.content ?? "");
       if (postResult.action === "reject") {
-        yield notify({ type: "error", error: new Error(postResult.reason) });
+        yield notify({
+          type: "error",
+          error: new HookRejectionError(`Post-LLM hook rejected: ${postResult.reason}`, "post_llm", postResult.reason),
+        });
         return;
       }
       if (postResult.action === "pause") {
@@ -156,10 +247,7 @@ export function createAgentLoop(config: LoopConfig): AgentLoop {
         return;
       }
 
-      let assistantText = assistantMsg.content;
-      if (postResult.action === "continue" && "transformed" in postResult) {
-        assistantText = postResult.transformed as string;
-      }
+      const assistantText = extractTransformed(postResult) ?? assistantMsg.content;
 
       if (assistantMsg.toolCalls.length > 0) {
         appendMessage(db, {
@@ -169,97 +257,20 @@ export function createAgentLoop(config: LoopConfig): AgentLoop {
           toolCalls: serializeToolCalls(assistantMsg.toolCalls),
           tokensIn: usage.inputTokens,
           tokensOut: usage.outputTokens,
-          costUsd: turnCostUsd,
+          costUsd: iterationCost,
         });
 
         const toolContext: ToolContext = {
           db,
           repoPath: config.repoPath,
           workingDir,
+          signal: config.signal,
         };
 
-        for (const toolCall of assistantMsg.toolCalls) {
-          const preToolResult = await config.hooks.runPreTool(hookCtx, toolCall.name, toolCall.input);
-          if (preToolResult.action === "pause") {
-            yield notify({ type: "paused", reason: preToolResult.reason });
-            appendEvent(db, {
-              type: "turn.paused",
-              payload: { reason: preToolResult.reason },
-              turn,
-            });
-            return;
-          }
-          if (preToolResult.action === "reject") {
-            const errorMsg = `Tool ${toolCall.name} rejected: ${preToolResult.reason}`;
-            yield notify({ type: "tool.error", name: toolCall.name, error: errorMsg });
-            appendMessage(db, { turn, role: "tool", toolCallId: toolCall.id, content: errorMsg });
-            appendEvent(db, {
-              type: "tool.failed",
-              payload: { tool: toolCall.name, error: errorMsg },
-              turn,
-            });
-            continue;
-          }
-
-          yield notify({ type: "tool.calling", name: toolCall.name, input: toolCall.input });
-          appendEvent(db, {
-            type: "tool.called",
-            payload: { tool: toolCall.name, input: toolCall.input },
-            turn,
-          });
-
-          const startMs = Date.now();
-          const output = await config.tools.execute(toolCall.name, toolCall.input, toolContext);
-          const durationMs = Date.now() - startMs;
-
-          let finalOutput = output;
-          const postToolResult = await config.hooks.runPostTool(hookCtx, toolCall.name, output);
-          if (postToolResult.action === "reject") {
-            yield notify({
-              type: "tool.error",
-              name: toolCall.name,
-              error: postToolResult.reason,
-            });
-            appendMessage(db, {
-              turn,
-              role: "tool",
-              toolCallId: toolCall.id,
-              content: postToolResult.reason,
-            });
-            appendEvent(db, {
-              type: "tool.failed",
-              payload: { tool: toolCall.name, error: postToolResult.reason },
-              turn,
-            });
-            recordToolCall(toolCall.name, durationMs, false);
-            continue;
-          }
-          if (postToolResult.action === "pause") {
-            yield notify({ type: "paused", reason: postToolResult.reason });
-            appendEvent(db, {
-              type: "turn.paused",
-              payload: { reason: postToolResult.reason },
-              turn,
-            });
-            return;
-          }
-          if (postToolResult.action === "continue" && "transformed" in postToolResult) {
-            finalOutput = postToolResult.transformed;
-          }
-
-          yield notify({ type: "tool.complete", name: toolCall.name, output: finalOutput, durationMs });
-          appendMessage(db, {
-            turn,
-            role: "tool",
-            toolCallId: toolCall.id,
-            content: finalOutput,
-          });
-          appendEvent(db, {
-            type: "tool.completed",
-            payload: { tool: toolCall.name, durationMs },
-            turn,
-          });
-          recordToolCall(toolCall.name, durationMs, true);
+        if (config.parallelToolExecution && assistantMsg.toolCalls.length > 1) {
+          yield* executeToolsParallel(toolExecConfig, db, turn, assistantMsg.toolCalls, toolContext, postHookCtx);
+        } else {
+          yield* executeToolsSequential(toolExecConfig, db, turn, assistantMsg.toolCalls, toolContext, postHookCtx);
         }
 
         continue;
@@ -271,10 +282,10 @@ export function createAgentLoop(config: LoopConfig): AgentLoop {
         content: assistantText ?? undefined,
         tokensIn: usage.inputTokens,
         tokensOut: usage.outputTokens,
-        costUsd: turnCostUsd,
+        costUsd: iterationCost,
       });
 
-      appendEvent(db, { type: "turn.completed", payload: { costUsd: turnCostUsd }, turn });
+      appendEvent(db, { type: "turn.complete", payload: { costUsd: turnCostUsd }, turn });
 
       yield notify({
         type: "turn.complete",
@@ -294,7 +305,7 @@ export function createAgentLoop(config: LoopConfig): AgentLoop {
 
     yield notify({
       type: "error",
-      error: new Error(`Max iterations (${maxIter}) reached`),
+      error: new LoopError(`Max iterations (${maxIter}) reached`, "max_iterations"),
     });
   }
 
@@ -305,10 +316,12 @@ export function createAgentLoop(config: LoopConfig): AgentLoop {
       appendEvent(db, { type: "turn.started", payload: {}, turn });
       yield notify({ type: "turn.started", turn });
 
-      const client = new Anthropic({ apiKey: config.apiKey });
-      yield* runAfterUserMessage(db, client, turn);
+      yield* runAfterUserMessage(db, turn);
     } catch (e) {
-      yield notify({ type: "error", error: e instanceof Error ? e : new Error(String(e)) });
+      yield notify({
+        type: "error",
+        error: e instanceof LoopError ? e : new LoopError(e instanceof Error ? e.message : String(e), "llm_api_error"),
+      });
     }
   }
 
@@ -316,20 +329,29 @@ export function createAgentLoop(config: LoopConfig): AgentLoop {
     try {
       const turn = getCurrentTurn(db);
       if (turn === 0) {
-        yield notify({ type: "error", error: new Error("No conversation to step") });
+        yield notify({ type: "error", error: new LoopError("No conversation to step", "no_conversation") });
         return;
       }
-      const client = new Anthropic({ apiKey: config.apiKey });
-      yield* runAfterUserMessage(db, client, turn);
+      yield* runAfterUserMessage(db, turn);
     } catch (e) {
-      yield notify({ type: "error", error: e instanceof Error ? e : new Error(String(e)) });
+      yield notify({
+        type: "error",
+        error: e instanceof LoopError ? e : new LoopError(e instanceof Error ? e.message : String(e), "llm_api_error"),
+      });
     }
   }
 
   async function* resume(db: AgentDB): AsyncGenerator<LoopEvent> {
-    const last = getLastEvent(db);
-    if (last?.type === "turn.completed") return;
-    yield* step(db);
+    try {
+      const last = getLastEvent(db);
+      if (last?.type === "turn.complete") return;
+      yield* step(db);
+    } catch (e) {
+      yield notify({
+        type: "error",
+        error: e instanceof LoopError ? e : new LoopError(e instanceof Error ? e.message : String(e), "llm_api_error"),
+      });
+    }
   }
 
   return { run, step, resume };

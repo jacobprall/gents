@@ -1,10 +1,7 @@
 import type { AgentBlueprint, AgentDB, Permission, ToolDef } from "./types";
-import { appendMessage } from "./conversation";
-
-function sqlError(op: string, cause: unknown): Error {
-  const msg = cause instanceof Error ? cause.message : String(cause);
-  return new Error(`${op} failed: ${msg}`);
-}
+import { sqlError } from "./errors";
+import { generateUUIDv7 } from "./uuid";
+import { DEFAULT_SKILLS, DEFAULT_SUBAGENT_DEFS } from "./default-skills";
 
 export const DEFAULT_EXCLUDE_PATTERNS: string[] = [
   "**/node_modules/**",
@@ -101,8 +98,14 @@ export const DEFAULT_BLUEPRINT: AgentBlueprint = {
     model: "default",
     max_turns: "64",
   },
+  skills: DEFAULT_SKILLS,
+  subagents: DEFAULT_SUBAGENT_DEFS,
 };
 
+/**
+ * Apply a blueprint's tools, permissions, patterns, config, and seed messages atomically.
+ * All operations (including message inserts) are within a single transaction.
+ */
 export function applyBlueprint(db: AgentDB, blueprint: AgentBlueprint): void {
   const now = Date.now();
   const tx = db.db.transaction(() => {
@@ -140,10 +143,73 @@ export function applyBlueprint(db: AgentDB, blueprint: AgentBlueprint): void {
       db.db
         .prepare(`INSERT OR REPLACE INTO config (key, value) VALUES (?,?)`)
         .run("system_instructions", blueprint.systemInstructions);
+
+      const id = generateUUIDv7();
+      db.db
+        .prepare(
+          `INSERT INTO messages (id, turn, role, content, tool_calls, tool_call_id, tokens_in, tokens_out, cost_usd, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        )
+        .run(id, 0, "system", blueprint.systemInstructions, null, null, null, null, null, now);
     }
 
     if (blueprint.name) {
       db.db.prepare(`INSERT OR REPLACE INTO config (key, value) VALUES (?,?)`).run("blueprint_name", blueprint.name);
+    }
+
+    if (blueprint.seedMessages != null) {
+      for (const msg of blueprint.seedMessages) {
+        const id = generateUUIDv7();
+        db.db
+          .prepare(
+            `INSERT INTO messages (id, turn, role, content, tool_calls, tool_call_id, tokens_in, tokens_out, cost_usd, created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?)`,
+          )
+          .run(
+            id,
+            msg.turn,
+            msg.role,
+            msg.content ?? null,
+            msg.toolCalls ?? null,
+            msg.toolCallId ?? null,
+            msg.tokensIn ?? null,
+            msg.tokensOut ?? null,
+            msg.costUsd ?? null,
+            now,
+          );
+      }
+    }
+
+    if (blueprint.skills != null) {
+      for (const skill of blueprint.skills) {
+        db.db
+          .prepare(
+            `INSERT OR REPLACE INTO skills (name, description, instructions, source, created_at)
+             VALUES (?, ?, ?, ?, ?)`,
+          )
+          .run(skill.name, skill.description, skill.instructions, skill.source ?? "blueprint", now);
+      }
+    }
+
+    if (blueprint.subagents != null) {
+      for (const sa of blueprint.subagents) {
+        db.db
+          .prepare(
+            `INSERT OR REPLACE INTO subagent_defs
+             (name, skill, description, allowed_tools, max_iterations, max_cost_usd, source, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            sa.name,
+            sa.skill,
+            sa.description,
+            JSON.stringify(sa.allowedTools),
+            sa.maxIterations ?? 10,
+            sa.maxCostUsd ?? null,
+            sa.source ?? "blueprint",
+            now,
+          );
+      }
     }
   });
 
@@ -151,16 +217,6 @@ export function applyBlueprint(db: AgentDB, blueprint: AgentBlueprint): void {
     tx();
   } catch (e) {
     throw sqlError("applyBlueprint", e);
-  }
-
-  if (blueprint.systemInstructions != null && blueprint.systemInstructions.length > 0) {
-    appendMessage(db, { turn: 0, role: "system", content: blueprint.systemInstructions });
-  }
-
-  if (blueprint.seedMessages != null) {
-    for (const msg of blueprint.seedMessages) {
-      appendMessage(db, msg);
-    }
   }
 }
 

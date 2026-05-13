@@ -13,6 +13,9 @@ function attachDescription(
 
 /**
  * Minimal Zod → JSON Schema conversion for Anthropic tool definitions.
+ *
+ * Throws on genuinely unsupported Zod types instead of silently emitting
+ * an empty object (which would give the LLM a wrong schema).
  */
 export function zodToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
   const unwrapEffects = (s: z.ZodTypeAny): z.ZodTypeAny => {
@@ -28,6 +31,19 @@ export function zodToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
     return attachDescription(schema, zodToJsonSchema(inner.unwrap()));
   }
 
+  if (inner instanceof z.ZodDefault) {
+    const base = zodToJsonSchema(inner.removeDefault());
+    return attachDescription(schema, { ...base, default: inner._def.defaultValue() });
+  }
+
+  if (inner instanceof z.ZodNullable) {
+    const base = zodToJsonSchema(inner.unwrap());
+    if (typeof base.type === "string") {
+      return attachDescription(schema, { ...base, type: [base.type, "null"] });
+    }
+    return attachDescription(schema, { oneOf: [base, { type: "null" }] });
+  }
+
   if (inner instanceof z.ZodString) {
     return attachDescription(schema, { type: "string" });
   }
@@ -38,6 +54,19 @@ export function zodToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
 
   if (inner instanceof z.ZodBoolean) {
     return attachDescription(schema, { type: "boolean" });
+  }
+
+  if (inner instanceof z.ZodLiteral) {
+    const val = inner.value;
+    const type =
+      typeof val === "string"
+        ? "string"
+        : typeof val === "number"
+          ? "number"
+          : typeof val === "boolean"
+            ? "boolean"
+            : "string";
+    return attachDescription(schema, { type, const: val });
   }
 
   if (inner instanceof z.ZodEnum) {
@@ -52,6 +81,19 @@ export function zodToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
     return attachDescription(schema, { type: "array", items });
   }
 
+  if (inner instanceof z.ZodRecord) {
+    const valType = (inner._def as { valueType: z.ZodTypeAny }).valueType;
+    return attachDescription(schema, {
+      type: "object",
+      additionalProperties: zodToJsonSchema(valType),
+    });
+  }
+
+  if (inner instanceof z.ZodUnion) {
+    const options = (inner._def.options as z.ZodTypeAny[]).map(zodToJsonSchema);
+    return attachDescription(schema, { oneOf: options });
+  }
+
   if (inner instanceof z.ZodObject) {
     const shape = inner.shape as Record<string, z.ZodTypeAny>;
     const properties: Record<string, unknown> = {};
@@ -60,7 +102,9 @@ export function zodToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
     for (const key of Object.keys(shape)) {
       const fieldSchema = shape[key]!;
       if (fieldSchema instanceof z.ZodOptional) {
-        properties[key] = zodToJsonSchema(fieldSchema.unwrap());
+        // Preserve any description on the ZodOptional wrapper itself.
+        const converted = zodToJsonSchema(fieldSchema.unwrap());
+        properties[key] = attachDescription(fieldSchema, converted);
       } else {
         required.push(key);
         properties[key] = zodToJsonSchema(fieldSchema);
@@ -77,5 +121,8 @@ export function zodToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
     return attachDescription(schema, obj);
   }
 
-  return attachDescription(schema, { type: "object", properties: {} });
+  throw new Error(
+    `zodToJsonSchema: unsupported Zod type "${inner.constructor.name}". ` +
+      "Add a handler or simplify the schema.",
+  );
 }

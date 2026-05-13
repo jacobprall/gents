@@ -1,4 +1,9 @@
-import type { ConfirmationConfig, Hook, HookContext, HookResult } from "./types";
+import type {
+  ConfirmationConfig,
+  Hook,
+  HookContext,
+  PreHookResult,
+} from "./types";
 
 export function confirmationGate(config: ConfirmationConfig): Hook {
   const requireConfirmation = config.requireConfirmation ?? [];
@@ -7,8 +12,8 @@ export function confirmationGate(config: ConfirmationConfig): Hook {
     async preTool(
       _context: HookContext,
       toolName: string,
-      input: unknown
-    ): Promise<HookResult> {
+      input: unknown,
+    ): Promise<PreHookResult> {
       if (!requireConfirmation.includes(toolName)) {
         return { action: "continue" };
       }

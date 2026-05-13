@@ -1,49 +1,12 @@
 import { z } from "zod";
 import type { ToolDefinition } from "../types.js";
+import type { SpawnResult } from "../utils.js";
+import { truncate, spawnWithTimeout } from "../utils.js";
 
-const MAX_OUT = 10000;
-
-function truncate(s: string): string {
-  if (s.length <= MAX_OUT) return s;
-  return `${s.slice(0, MAX_OUT)}\n...[truncated ${s.length - MAX_OUT} chars]`;
-}
-
-async function gitSpawn(cwd: string, args: string[], killMs?: number): Promise<{ out: string; code: number | null }> {
-  const proc = Bun.spawn(["git", ...args], {
-    cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-
-  let timedOut = false;
-  const timer =
-    killMs !== undefined
-      ? setTimeout(() => {
-          timedOut = true;
-          proc.kill();
-        }, killMs)
-      : undefined;
-
-  let stdout = "";
-  let stderr = "";
-  try {
-    stdout = await new Response(proc.stdout).text();
-    stderr = await new Response(proc.stderr).text();
-  } catch {
-    /* killed */
-  }
-
-  let code: number | null = null;
-  try {
-    code = await proc.exited;
-  } catch {
-    code = null;
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-
-  const combined = [stdout, stderr, timedOut ? "\n[process killed by timeout]" : ""].join("").trimEnd();
-  return { out: combined, code };
+function formatGitResult(result: SpawnResult): string {
+  const out = [result.stdout, result.stderr].filter(Boolean).join("").trimEnd();
+  const timeout = result.timedOut ? "\n[process killed by timeout]" : "";
+  return `${out}${timeout}\n[exit code: ${result.exitCode ?? "unknown"}]`;
 }
 
 export const gitStatusTool: ToolDefinition = {
@@ -52,8 +15,11 @@ export const gitStatusTool: ToolDefinition = {
   inputSchema: z.object({}),
   async execute(_input, context): Promise<string> {
     try {
-      const { out, code } = await gitSpawn(context.workingDir, ["status", "--porcelain"]);
-      return truncate(`${out}\n[exit code: ${code ?? "unknown"}]`);
+      const result = await spawnWithTimeout(["git", "status", "--porcelain"], {
+        cwd: context.workingDir,
+        signal: context.signal,
+      });
+      return truncate(formatGitResult(result));
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return `Error: ${msg}`;
@@ -71,10 +37,13 @@ export const gitDiffTool: ToolDefinition = {
   inputSchema: gitDiffSchema,
   async execute(input, context): Promise<string> {
     try {
-      const parsed = gitDiffSchema.parse(input);
-      const args = parsed.staged ? ["diff", "--staged"] : ["diff"];
-      const { out, code } = await gitSpawn(context.workingDir, args);
-      return truncate(`${out}\n[exit code: ${code ?? "unknown"}]`);
+      const { staged } = input as z.infer<typeof gitDiffSchema>;
+      const args = staged ? ["diff", "--staged"] : ["diff"];
+      const result = await spawnWithTimeout(["git", ...args], {
+        cwd: context.workingDir,
+        signal: context.signal,
+      });
+      return truncate(formatGitResult(result));
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return `Error: ${msg}`;
@@ -84,7 +53,7 @@ export const gitDiffTool: ToolDefinition = {
 
 const gitCommitSchema = z.object({
   message: z.string().min(1),
-  files: z.array(z.string()).optional().describe("If set, `git add` each path before committing"),
+  files: z.array(z.string()).optional().describe("If set, `git add` these paths before committing"),
 });
 
 export const gitCommitTool: ToolDefinition = {
@@ -93,27 +62,29 @@ export const gitCommitTool: ToolDefinition = {
   inputSchema: gitCommitSchema,
   async execute(input, context): Promise<string> {
     try {
-      const parsed = gitCommitSchema.parse(input);
+      const { message, files } = input as z.infer<typeof gitCommitSchema>;
       const lines: string[] = [];
 
-      if (parsed.files?.length) {
-        for (const f of parsed.files) {
-          const { out: addOut, code: addCode } = await gitSpawn(context.workingDir, ["add", "--", f]);
-          lines.push(`git add ${f}: exit ${addCode ?? "unknown"}`, addOut);
-          if (addCode !== 0) {
-            return truncate(lines.filter(Boolean).join("\n"));
-          }
+      if (files?.length) {
+        const addResult = await spawnWithTimeout(["git", "add", "--", ...files], {
+          cwd: context.workingDir,
+          signal: context.signal,
+        });
+        lines.push(`git add: exit ${addResult.exitCode ?? "unknown"}`);
+        const addOutput = [addResult.stdout, addResult.stderr].filter(Boolean).join("").trimEnd();
+        if (addOutput) lines.push(addOutput);
+        if (addResult.exitCode !== 0) {
+          return truncate(lines.join("\n"));
         }
       }
 
-      const { out: commitOut, code: commitCode } = await gitSpawn(context.workingDir, [
-        "commit",
-        "-m",
-        parsed.message,
-      ]);
-      lines.push(commitOut, `[exit code: ${commitCode ?? "unknown"}]`);
+      const commitResult = await spawnWithTimeout(["git", "commit", "-m", message], {
+        cwd: context.workingDir,
+        signal: context.signal,
+      });
+      lines.push(formatGitResult(commitResult));
 
-      return truncate(lines.filter(Boolean).join("\n"));
+      return truncate(lines.join("\n"));
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return `Error: ${msg}`;

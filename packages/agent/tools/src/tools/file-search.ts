@@ -1,19 +1,9 @@
 import path from "node:path";
 import { z } from "zod";
 import type { ToolDefinition } from "../types.js";
+import { resolveSafePath } from "../utils.js";
 
 const MAX_RESULTS = 100;
-
-function resolveSafeSubdir(repoPath: string, userSubdir?: string): string {
-  const root = path.resolve(repoPath);
-  const sub = userSubdir ?? ".";
-  const resolved = path.resolve(root, sub);
-  const rel = path.relative(root, resolved);
-  if (rel.startsWith("..") || path.isAbsolute(rel)) {
-    throw new Error("Search path escapes repository root");
-  }
-  return resolved;
-}
 
 const inputSchema = z.object({
   pattern: z.string().describe('Glob pattern e.g. "**/*.ts"'),
@@ -26,9 +16,11 @@ export const fileSearchTool: ToolDefinition = {
   inputSchema,
   async execute(input, context): Promise<string> {
     try {
-      const parsed = inputSchema.parse(input);
-      const cwd = resolveSafeSubdir(context.repoPath, parsed.path);
-      const glob = new Bun.Glob(parsed.pattern);
+      const { pattern, path: subdir } = input as z.infer<typeof inputSchema>;
+      const cwd = subdir
+        ? resolveSafePath(context.repoPath, subdir)
+        : path.resolve(context.repoPath);
+      const glob = new Bun.Glob(pattern);
       const found: string[] = [];
       const root = path.resolve(context.repoPath);
       for await (const match of glob.scan({ cwd, onlyFiles: true })) {
@@ -38,7 +30,7 @@ export const fileSearchTool: ToolDefinition = {
         if (found.length >= MAX_RESULTS) break;
       }
       if (found.length === 0) {
-        return `No files matched pattern "${parsed.pattern}" under ${parsed.path ?? "."}.`;
+        return `No files matched pattern "${pattern}" under ${subdir ?? "."}.`;
       }
       const suffix = found.length >= MAX_RESULTS ? `\n(showing first ${MAX_RESULTS} matches)` : "";
       return `${found.join("\n")}${suffix}`;

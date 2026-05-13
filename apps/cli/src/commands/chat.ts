@@ -1,4 +1,4 @@
-import { createAgentLoop, type LoopEvent } from "@gents/agent-loop";
+import { createAgentLoop, createChildLoopFactory, type LoopEvent } from "@gents/agent-loop";
 import {
   compactConversation,
   getCurrentTurn,
@@ -6,6 +6,7 @@ import {
   getSessionMetrics,
   hybridSearch,
   indexCodebase,
+  loadSkillsFromDir,
 } from "@gents/agent-db";
 import {
   confirmationGate,
@@ -24,6 +25,7 @@ import {
   cyan,
   dim,
   printCost,
+  printDebug,
   printError,
   printInfo,
   printToolComplete,
@@ -33,8 +35,6 @@ import {
 import { resolveConfig } from "../config";
 import { createDefaultPrompt } from "../prompt";
 import { openSession } from "../session";
-
-const VERSION = "0.1.0";
 
 function handleLoopEvent(event: LoopEvent): void {
   switch (event.type) {
@@ -78,7 +78,6 @@ function handleLoopEvent(event: LoopEvent): void {
     case "paused":
       printInfo(dim(`Paused: ${event.reason}`));
       break;
-
   }
 }
 
@@ -95,7 +94,11 @@ async function confirmationPromptFn(toolName: string, input: unknown): Promise<b
   });
 }
 
-async function handleSlashCommand(line: string, db: Parameters<typeof getCurrentTurn>[0], repoPath: string): Promise<void> {
+async function handleSlashCommand(
+  line: string,
+  db: Parameters<typeof getCurrentTurn>[0],
+  repoPath: string,
+): Promise<void> {
   const body = line.slice(1).trim();
   const firstSpace = body.indexOf(" ");
   const cmd = (firstSpace === -1 ? body : body.slice(0, firstSpace)).toLowerCase();
@@ -109,7 +112,7 @@ async function handleSlashCommand(line: string, db: Parameters<typeof getCurrent
   ${cyan("/index")}           — Rebuild/update the codebase index for this repo
   ${cyan("/cost")}            — Session cost and token metrics
   ${cyan("/status")}          — Index + session status
-  ${cyan("/exit")}            — Quit the REPL`);
+  ${cyan("/exit")}, ${cyan("/quit")}    — Quit the REPL`);
       break;
     }
     case "compact": {
@@ -132,7 +135,9 @@ async function handleSlashCommand(line: string, db: Parameters<typeof getCurrent
         break;
       }
       for (const r of hits) {
-        console.log(`\n  ${cyan(r.path)}:${String(r.startLine)}-${String(r.endLine)} ${dim(`(score: ${r.score.toFixed(2)})`)}`);
+        console.log(
+          `\n  ${cyan(r.path)}:${String(r.startLine)}-${String(r.endLine)} ${dim(`(score: ${r.score.toFixed(2)})`)}`,
+        );
         console.log(`  ${"─".repeat(40)}`);
         const lines = r.chunkText.split("\n");
         for (const ln of lines.slice(0, 6)) console.log(`  ${ln}`);
@@ -144,7 +149,9 @@ async function handleSlashCommand(line: string, db: Parameters<typeof getCurrent
     case "index": {
       printInfo(`Indexing ${repoPath}…`);
       const result = indexCodebase(db, repoPath);
-      printInfo(`Indexed ${String(result.filesScanned)} files, ${String(result.chunksCreated)} chunks in ${String(result.elapsedMs)}ms`);
+      printInfo(
+        `Indexed ${String(result.filesScanned)} files, ${String(result.chunksCreated)} chunks in ${String(result.elapsedMs)}ms`,
+      );
       break;
     }
     case "cost": {
@@ -175,120 +182,166 @@ export const chatCommand = new Command("chat")
   .option("--model <model>", "Override model")
   .option("--no-index", "Skip index freshness check")
   .option("--no-confirm", "Skip tool confirmation prompts")
-  .action(async (opts: {
-    repo: string;
-    session: string;
-    new?: boolean;
-    model?: string;
-    index?: boolean;
-    confirm?: boolean;
-  }) => {
-    try {
-      const repoPath = path.resolve(opts.repo);
-      const config = resolveConfig({
-        model: opts.model,
-        ...(typeof opts.confirm === "boolean" ? { confirmDestructive: opts.confirm } : {}),
-      });
-      const db = openSession(repoPath, {
-        session: opts.session,
-        forceNew: Boolean(opts.new),
-      });
-
-      if (opts.index !== false && config.autoIndex) {
-        const status = getIndexStatus(db);
-        if (status.totalChunks === 0) {
-          printInfo("Building initial code index...");
-          const result = indexCodebase(db, repoPath);
-          printInfo(
-            `Indexed ${String(result.filesScanned)} files, ${String(result.chunksCreated)} chunks in ${String(result.elapsedMs)}ms`,
-          );
-        }
-      }
-
-      const registry = createToolRegistry();
-      registerBuiltinTools(registry);
-      const toolDefs = registry.listForLLM();
-
-      const hookList = [
-        costGuard({ maxCostPerSession: config.maxCostPerSession }),
-        credentialRedactor(),
-        toolGovernance({}),
-        ...(config.confirmDestructive
-          ? [
-              confirmationGate({
-                requireConfirmation: ["bash", "file_write", "file_edit", "git_commit"],
-                promptFn: confirmationPromptFn,
-              }),
-            ]
-          : []),
-      ];
-      const hooks = createHookPipeline(hookList);
-
-      const prompt = createDefaultPrompt(toolDefs);
-
-      const loop = createAgentLoop({
-        model: config.model,
-        apiKey: config.apiKey,
-        tools: registry,
-        hooks,
-        ctx: prompt,
-        repoPath,
-        maxCostPerSession: config.maxCostPerSession,
-      });
-
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
-      const shutdown = (code?: number): void => {
-        rl.close();
-        process.exit(code ?? 0);
-      };
-
-      rl.on("close", () => {
-        printInfo(dim("Goodbye."));
-      });
-
-      process.once("SIGINT", () => {
-        process.stdout.write("\n");
-        shutdown(130);
-      });
-
-      console.log(`\n  ${bold("gents")} v${VERSION}`);
-      console.log(`  Session: ${opts.session} | Model: ${config.model}`);
-      console.log(`  Repo: ${repoPath}`);
-      console.log(`  Type ${cyan("/help")} for commands, ${cyan("/exit")} to quit.\n`);
-
-      const promptUser = (): void => {
-        rl.question("\n  You: ", (input: string) => {
-          void (async () => {
-            const trimmed = input.trim();
-            if (!trimmed || trimmed === "/exit") {
-              shutdown(0);
-              return;
-            }
-
-            if (trimmed.startsWith("/")) {
-              await handleSlashCommand(trimmed, db, repoPath);
-              promptUser();
-              return;
-            }
-
-            process.stdout.write("\n");
-            try {
-              for await (const event of loop.run(db, trimmed)) {
-                handleLoopEvent(event);
-              }
-            } catch (e) {
-              printError(e instanceof Error ? e.message : String(e));
-            }
-
-            promptUser();
-          })();
+  .action(
+    async (opts: {
+      repo: string;
+      session: string;
+      new?: boolean;
+      model?: string;
+      index?: boolean;
+      confirm?: boolean;
+    }) => {
+      try {
+        const repoPath = path.resolve(opts.repo);
+        const config = resolveConfig({
+          model: opts.model,
+          ...(typeof opts.confirm === "boolean" ? { confirmDestructive: opts.confirm } : {}),
         });
-      };
+        const db = openSession(repoPath, {
+          session: opts.session,
+          forceNew: Boolean(opts.new),
+        });
 
-      promptUser();
-    } catch (e) {
-      printError(e instanceof Error ? e.message : String(e));
-      process.exit(1);
-    }
-  });
+        if (opts.index !== false && config.autoIndex) {
+          const status = getIndexStatus(db);
+          if (status.totalChunks === 0) {
+            printInfo("Building initial code index...");
+            const result = indexCodebase(db, repoPath);
+            printInfo(
+              `Indexed ${String(result.filesScanned)} files, ${String(result.chunksCreated)} chunks in ${String(result.elapsedMs)}ms`,
+            );
+          } else {
+            printDebug(`Index: ${String(status.totalChunks)} chunks from ${String(status.totalFiles)} files`);
+          }
+        }
+
+        const registry = createToolRegistry();
+        registerBuiltinTools(registry);
+        const toolDefs = registry.listForLLM();
+
+        const interactive = process.stdin.isTTY ?? false;
+
+        const hookList = [
+          costGuard({ maxCostPerSession: config.maxCostPerSession }),
+          credentialRedactor(),
+          toolGovernance({}),
+          ...(config.confirmDestructive && interactive
+            ? [
+                confirmationGate({
+                  requireConfirmation: ["bash", "file_write", "file_edit", "git_commit"],
+                  promptFn: confirmationPromptFn,
+                }),
+              ]
+            : []),
+        ];
+        const hooks = createHookPipeline(hookList);
+
+        const skills = loadSkillsFromDir(path.join(repoPath, ".gents", "skills"));
+        if (skills.length > 0) {
+          printDebug(`Loaded ${String(skills.length)} skill(s): ${skills.map((s) => s.name).join(", ")}`);
+        }
+
+        const prompt = createDefaultPrompt(toolDefs, skills);
+
+        const childLoopFactory = createChildLoopFactory({
+          model: config.model,
+          apiKey: config.apiKey,
+          parentRegistry: registry,
+        });
+
+        const loop = createAgentLoop({
+          model: config.model,
+          apiKey: config.apiKey,
+          tools: registry,
+          hooks,
+          ctx: prompt,
+          repoPath,
+          maxCostPerSession: config.maxCostPerSession,
+          childLoopFactory,
+        });
+
+        if (!interactive) {
+          const chunks: string[] = [];
+          process.stdin.setEncoding("utf8");
+          for await (const chunk of process.stdin) {
+            chunks.push(chunk as string);
+          }
+          const piped = chunks.join("").trim();
+          if (!piped) {
+            printError("No input received from stdin.");
+            process.exit(1);
+          }
+          printDebug(`Piped input (${String(piped.length)} chars), running single turn`);
+          for await (const event of loop.run(db, piped)) {
+            handleLoopEvent(event);
+          }
+          process.exit(0);
+        }
+
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+        const shutdown = (code?: number): void => {
+          rl.close();
+          process.exit(code ?? 0);
+        };
+
+        rl.on("close", () => {
+          printInfo(dim("Goodbye."));
+        });
+
+        process.once("SIGINT", () => {
+          process.stdout.write("\n");
+          shutdown(130);
+        });
+
+        console.log(`\n  ${bold("gents")} v0.1.0`);
+        console.log(`  Session: ${opts.session} | Model: ${config.model}`);
+        console.log(`  Repo: ${repoPath}`);
+        console.log(`  Type ${cyan("/help")} for commands, ${cyan("/exit")} to quit.\n`);
+
+        let busy = false;
+
+        const promptUser = (): void => {
+          rl.question("\n  You: ", (input: string) => {
+            void (async () => {
+              const trimmed = input.trim();
+              if (!trimmed || trimmed === "/exit" || trimmed === "/quit") {
+                shutdown(0);
+                return;
+              }
+
+              if (trimmed.startsWith("/")) {
+                await handleSlashCommand(trimmed, db, repoPath);
+                promptUser();
+                return;
+              }
+
+              if (busy) {
+                printInfo("Still processing the previous message. Please wait.");
+                promptUser();
+                return;
+              }
+
+              busy = true;
+              process.stdout.write("\n");
+              try {
+                for await (const event of loop.run(db, trimmed)) {
+                  handleLoopEvent(event);
+                }
+              } catch (e) {
+                printError(e instanceof Error ? e.message : String(e));
+              }
+              busy = false;
+
+              promptUser();
+            })();
+          });
+        };
+
+        promptUser();
+      } catch (e) {
+        printError(e instanceof Error ? e.message : String(e));
+        process.exit(1);
+      }
+    },
+  );

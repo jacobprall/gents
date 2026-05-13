@@ -1,14 +1,12 @@
 import type { Database } from "bun:sqlite";
 
-/** Wrapper around Bun’s SQLite handle plus session/extension state. */
 export interface AgentDB {
   readonly db: Database;
-  /** Repo root used for indexing and relative paths. */
-  repoPath: string;
-  /** Database file path (empty string for :memory:). */
-  dbPath: string;
-  /** True when optional native extensions (e.g. sqlite-vector / sqlite-ai) loaded successfully. */
-  modelLoaded: boolean;
+  readonly repoPath: string;
+  readonly dbPath: string;
+  readonly modelLoaded: boolean;
+  /** Cached result of vector extension probe (undefined = not yet tested). */
+  vectorAvailable?: boolean;
 }
 
 export interface ToolDef {
@@ -25,6 +23,23 @@ export interface Permission {
   pattern: string;
 }
 
+export interface Skill {
+  name: string;
+  description: string;
+  instructions: string;
+  source?: "builtin" | "blueprint" | "user";
+}
+
+export interface SubagentDef {
+  name: string;
+  skill: string;
+  description: string;
+  allowedTools: string[];
+  maxIterations?: number;
+  maxCostUsd?: number;
+  source?: "builtin" | "blueprint" | "user";
+}
+
 export interface AgentBlueprint {
   name: string;
   tools: ToolDef[];
@@ -33,6 +48,8 @@ export interface AgentBlueprint {
   config: Record<string, string>;
   seedMessages?: NewMessage[];
   systemInstructions?: string;
+  skills?: Skill[];
+  subagents?: SubagentDef[];
 }
 
 export interface NewMessage {

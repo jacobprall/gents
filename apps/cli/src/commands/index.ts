@@ -8,11 +8,12 @@ import { openSession } from "../session";
 export const indexCommand = new Command("index")
   .description("Build or update the code search index")
   .option("--repo <path>", "Repository path", process.cwd())
+  .option("--session <id>", "Session ID", "default")
   .option("--force", "Force full re-index")
   .option("--stats", "Show indexing stats")
-  .action(async (opts: { repo: string; force?: boolean; stats?: boolean }) => {
+  .action(async (opts: { repo: string; session: string; force?: boolean; stats?: boolean }) => {
     const repoPath = path.resolve(opts.repo);
-    const db = openSession(repoPath);
+    const db = openSession(repoPath, { session: opts.session });
 
     printInfo(`Indexing ${repoPath}...`);
     const result = indexCodebase(db, repoPath, { forceReindex: Boolean(opts.force) });

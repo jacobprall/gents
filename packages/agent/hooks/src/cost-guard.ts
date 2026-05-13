@@ -1,25 +1,31 @@
-import type { CostGuardConfig, Hook, HookContext, HookResult } from "./types";
+import type {
+  CostGuardConfig,
+  Hook,
+  HookContext,
+  PostHookResult,
+  PreHookResult,
+} from "./types";
+
+type ShortCircuitResult =
+  | { action: "pause"; reason: string }
+  | { action: "reject"; reason: string };
 
 function evaluateCost(
   context: HookContext,
-  config: CostGuardConfig
-): HookResult | null {
+  config: CostGuardConfig,
+): ShortCircuitResult | null {
   const mode = config.onExceeded ?? "pause";
   if (
     config.maxCostPerSession != null &&
     context.sessionCostUsd >= config.maxCostPerSession
   ) {
-    return mode === "pause"
-      ? { action: "pause", reason: "Session cost limit exceeded" }
-      : { action: "reject", reason: "Session cost limit exceeded" };
+    return { action: mode, reason: "Session cost limit exceeded" };
   }
   if (
     config.maxCostPerTurn != null &&
     context.turnCostUsd >= config.maxCostPerTurn
   ) {
-    return mode === "pause"
-      ? { action: "pause", reason: "Turn cost limit exceeded" }
-      : { action: "reject", reason: "Turn cost limit exceeded" };
+    return { action: mode, reason: "Turn cost limit exceeded" };
   }
   return null;
 }
@@ -27,10 +33,13 @@ function evaluateCost(
 export function costGuard(config: CostGuardConfig): Hook {
   return {
     name: "cost-guard",
-    async preLLM(context: HookContext): Promise<HookResult> {
+    async preLLM(context: HookContext): Promise<PreHookResult> {
       return evaluateCost(context, config) ?? { action: "continue" };
     },
-    async postLLM(context: HookContext, _responseText: string): Promise<HookResult> {
+    async postLLM(
+      context: HookContext,
+      _responseText: string,
+    ): Promise<PostHookResult> {
       return evaluateCost(context, config) ?? { action: "continue" };
     },
   };

@@ -8,14 +8,16 @@ import { openSession } from "../session";
 export const inspectCommand = new Command("inspect")
   .description("Inspect the local agent database")
   .option("--repo <path>", "Repository path", process.cwd())
+  .option("--session <id>", "Session ID", "default")
   .option("--table <name>", "Dump rows from table (recent first)")
   .option("--events", "List recent timeline events")
   .option("--conversation", "Dump conversation snapshot used for assembly")
   .option("--stats", "Counts for major tables")
-  .option("--sql <query>", "Run read-only-ish SQL SELECT (use carefully)")
+  .option("--sql <query>", "Run a read-only SQL SELECT or PRAGMA query")
   .action(
     async (opts: {
       repo: string;
+      session: string;
       table?: string;
       events?: boolean;
       conversation?: boolean;
@@ -23,12 +25,17 @@ export const inspectCommand = new Command("inspect")
       sql?: string;
     }) => {
       const repoPath = path.resolve(opts.repo);
-      const db = openSession(repoPath);
+      const db = openSession(repoPath, { session: opts.session });
 
       if (opts.sql) {
         const q = opts.sql.trim();
-        if (!/^\s*select\s/i.test(q) && !/^\s*pragma\s+/i.test(q)) {
-          printError("Only SELECT and PRAGMA queries are allowed via --sql");
+        const isSelect = /^\s*select\s/i.test(q);
+        const isPragma = /^\s*pragma\s/i.test(q);
+        if ((!isSelect && !isPragma) || q.includes(";") || (isPragma && q.includes("="))) {
+          printError(
+            "Only read-only SELECT and PRAGMA queries are allowed via --sql.\n" +
+              "  Multi-statement queries (;) and PRAGMA writes (=) are blocked.",
+          );
           process.exitCode = 1;
           return;
         }
@@ -50,7 +57,9 @@ export const inspectCommand = new Command("inspect")
           return;
         }
         try {
-          const rows = db.db.prepare(`SELECT * FROM "${name}" ORDER BY rowid DESC LIMIT 100`).all() as unknown[];
+          const rows = db.db
+            .prepare(`SELECT * FROM "${name}" ORDER BY rowid DESC LIMIT 100`)
+            .all() as unknown[];
           console.log(JSON.stringify(rows, null, 2));
         } catch (e) {
           printError(e instanceof Error ? e.message : String(e));

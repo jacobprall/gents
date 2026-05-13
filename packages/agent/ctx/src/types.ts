@@ -1,16 +1,6 @@
 import type { AgentDB } from "@gents/agent-db";
 
-export interface Section {
-  name: string;
-  placement: "static" | "dynamic";
-  resolve: (db: AgentDB, context: AssemblyContext) => string | ContentBlock[];
-}
-
-export interface AssemblyContext {
-  searchQuery?: string;
-  currentTurn?: number;
-  [key: string]: unknown;
-}
+export type MaybePromise<T> = T | Promise<T>;
 
 export interface ContentBlock {
   type: "text";
@@ -18,10 +8,19 @@ export interface ContentBlock {
   cache_control?: { type: "ephemeral" };
 }
 
-export interface AnthropicSystemBlock {
-  type: "text";
-  text: string;
-  cache_control?: { type: "ephemeral" };
+/** @deprecated Use ContentBlock directly. */
+export type AnthropicSystemBlock = ContentBlock;
+
+export interface Section {
+  name: string;
+  placement: "static" | "dynamic";
+  resolve: (db: AgentDB, context: AssemblyContext) => MaybePromise<string | ContentBlock[]>;
+}
+
+export interface AssemblyContext {
+  searchQuery?: string;
+  currentTurn?: number;
+  metadata?: Record<string, unknown>;
 }
 
 export interface AnthropicMessage {
@@ -45,17 +44,30 @@ export interface AnthropicToolDef {
   input_schema: Record<string, unknown>;
 }
 
+export type ConversationResolver = (
+  db: AgentDB,
+  context: AssemblyContext,
+) => MaybePromise<unknown>;
+
 export interface PromptConfig {
   sections: Section[];
   tools?: AnthropicToolDef[];
+  conversationResolver?: ConversationResolver;
+  /** Approximate max tokens for the system prompt. Sections are dropped (lowest priority first) if exceeded. */
+  maxSystemTokens?: number;
+}
+
+export interface SectionWithPriority extends Section {
+  /** Higher = more important, kept when trimming. Default: 0. */
+  priority?: number;
 }
 
 export interface AssembleResult {
-  system: AnthropicSystemBlock[];
+  system: ContentBlock[];
   messages: AnthropicMessage[];
   tools: AnthropicToolDef[];
 }
 
 export interface Prompt {
-  assemble(db: AgentDB, context: AssemblyContext): AssembleResult;
+  assemble(db: AgentDB, context: AssemblyContext): Promise<AssembleResult>;
 }

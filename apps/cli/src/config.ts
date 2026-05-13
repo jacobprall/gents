@@ -12,7 +12,7 @@ export interface ResolvedConfig {
 
 let _globalcache: Record<string, unknown> | null | undefined;
 
-function globalConfigPath(): string {
+export function globalConfigPath(): string {
   return pathJoin(homedir(), ".gents", "config.json");
 }
 

@@ -1,10 +1,6 @@
+import { sqlError } from "./errors";
 import type { AgentDB, ConversationOptions, Message, NewMessage } from "./types";
 import { generateUUIDv7 } from "./uuid";
-
-function sqlError(op: string, cause: unknown): Error {
-  const msg = cause instanceof Error ? cause.message : String(cause);
-  return new Error(`${op} failed: ${msg}`);
-}
 
 interface MessageRow {
   id: string;
@@ -34,7 +30,6 @@ function rowToMessage(r: MessageRow): Message {
   };
 }
 
-/** Insert a message row and return it with id + timestamp. */
 export function appendMessage(db: AgentDB, msg: NewMessage): Message {
   const id = generateUUIDv7();
   const createdAt = Date.now();
@@ -62,7 +57,6 @@ export function appendMessage(db: AgentDB, msg: NewMessage): Message {
   return { ...msg, id, createdAt };
 }
 
-/** Highest turn in messages, or 0 if none. */
 export function getCurrentTurn(db: AgentDB): number {
   try {
     const row = db.db.prepare(`SELECT MAX(turn) AS m FROM messages`).get() as { m: number | null } | undefined;
@@ -73,7 +67,6 @@ export function getCurrentTurn(db: AgentDB): number {
   }
 }
 
-/** Record a compaction boundary; later reads use the summary plus messages after this turn. */
 export function compactConversation(db: AgentDB, upToTurn: number, summary: string): void {
   const id = generateUUIDv7();
   const createdAt = Date.now();
@@ -89,25 +82,17 @@ export function compactConversation(db: AgentDB, upToTurn: number, summary: stri
 function estimateTokens(m: Message): number {
   const t = (m.tokensIn ?? 0) + (m.tokensOut ?? 0);
   if (t > 0) return t;
-  return Math.max(1, Math.ceil(((m.content?.length ?? 0) + (m.toolCalls?.length ?? 0)) / 4));
+  const charLen =
+    (m.content?.length ?? 0) +
+    (m.toolCalls?.length ?? 0) +
+    (m.toolCallId?.length ?? 0);
+  return Math.max(1, Math.ceil(charLen / 4));
 }
 
-function truncateByTokens(messages: Message[], maxTokens: number): Message[] {
-  let budget = maxTokens;
-  const keptTail: Message[] = [];
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i]!;
-    const cost = estimateTokens(m);
-    if (budget - cost < 0 && keptTail.length > 0) {
-      break;
-    }
-    budget -= cost;
-    keptTail.unshift(m);
-  }
-  return keptTail;
-}
-
-/** Messages for context: latest compaction summary (as system) plus rows after that marker, ordered by turn. */
+/**
+ * Retrieve messages for context window. Uses a reverse-scan approach when maxTokens
+ * is specified to avoid loading the entire conversation history into memory.
+ */
 export function getConversation(db: AgentDB, opts?: ConversationOptions): Message[] {
   try {
     const marker = db.db
@@ -115,42 +100,33 @@ export function getConversation(db: AgentDB, opts?: ConversationOptions): Messag
       .get() as { id: string; up_to_turn: number; summary: string; created_at: number } | undefined;
 
     const fromTurn = opts?.fromTurn;
+    const maxTokens = opts?.maxTokens;
+    const markerTurn = marker?.up_to_turn;
+
+    const effectiveFrom = Math.max(markerTurn != null ? markerTurn + 1 : 0, fromTurn ?? 0);
+
+    if (maxTokens != null && maxTokens > 0) {
+      return getConversationWithBudget(db, marker, effectiveFrom, maxTokens);
+    }
 
     let rows: MessageRow[];
-    if (marker) {
-      if (fromTurn != null) {
-        rows = db.db
-          .prepare(
-            `SELECT id, turn, role, content, tool_calls, tool_call_id, tokens_in, tokens_out, cost_usd, created_at
-             FROM messages WHERE turn > ? AND turn >= ? ORDER BY turn ASC, created_at ASC`,
-          )
-          .all(marker.up_to_turn, fromTurn) as Array<MessageRow>;
-      } else {
-        rows = db.db
-          .prepare(
-            `SELECT id, turn, role, content, tool_calls, tool_call_id, tokens_in, tokens_out, cost_usd, created_at
-             FROM messages WHERE turn > ? ORDER BY turn ASC, created_at ASC`,
-          )
-          .all(marker.up_to_turn) as Array<MessageRow>;
-      }
-    } else if (fromTurn != null) {
+    if (effectiveFrom > 0) {
       rows = db.db
         .prepare(
           `SELECT id, turn, role, content, tool_calls, tool_call_id, tokens_in, tokens_out, cost_usd, created_at
            FROM messages WHERE turn >= ? ORDER BY turn ASC, created_at ASC`,
         )
-        .all(fromTurn) as Array<MessageRow>;
+        .all(effectiveFrom) as MessageRow[];
     } else {
       rows = db.db
         .prepare(
           `SELECT id, turn, role, content, tool_calls, tool_call_id, tokens_in, tokens_out, cost_usd, created_at
            FROM messages ORDER BY turn ASC, created_at ASC`,
         )
-        .all() as Array<MessageRow>;
+        .all() as MessageRow[];
     }
 
     const messages = rows.map(rowToMessage);
-    let combined: Message[] = messages;
 
     if (marker) {
       const summaryMsg: Message = {
@@ -160,15 +136,70 @@ export function getConversation(db: AgentDB, opts?: ConversationOptions): Messag
         content: marker.summary,
         createdAt: marker.created_at,
       };
-      combined = [summaryMsg, ...messages];
+      return [summaryMsg, ...messages];
     }
 
-    if (opts?.maxTokens != null && opts.maxTokens > 0 && combined.length > 0) {
-      combined = truncateByTokens(combined, opts.maxTokens);
-    }
-
-    return combined;
+    return messages;
   } catch (e) {
     throw sqlError("getConversation", e);
   }
+}
+
+/**
+ * Reverse-scan messages to fill token budget without loading everything.
+ */
+function getConversationWithBudget(
+  db: AgentDB,
+  marker: { id: string; up_to_turn: number; summary: string; created_at: number } | undefined,
+  effectiveFrom: number,
+  maxTokens: number,
+): Message[] {
+  let rows: MessageRow[];
+  if (effectiveFrom > 0) {
+    rows = db.db
+      .prepare(
+        `SELECT id, turn, role, content, tool_calls, tool_call_id, tokens_in, tokens_out, cost_usd, created_at
+         FROM messages WHERE turn >= ? ORDER BY turn DESC, created_at DESC`,
+      )
+      .all(effectiveFrom) as MessageRow[];
+  } else {
+    rows = db.db
+      .prepare(
+        `SELECT id, turn, role, content, tool_calls, tool_call_id, tokens_in, tokens_out, cost_usd, created_at
+         FROM messages ORDER BY turn DESC, created_at DESC`,
+      )
+      .all() as MessageRow[];
+  }
+
+  let budget = maxTokens;
+  const kept: Message[] = [];
+
+  if (marker) {
+    const summaryMsg: Message = {
+      id: marker.id,
+      turn: marker.up_to_turn,
+      role: "system",
+      content: marker.summary,
+      createdAt: marker.created_at,
+    };
+    budget -= estimateTokens(summaryMsg);
+    kept.push(summaryMsg);
+  }
+
+  for (const row of rows) {
+    const msg = rowToMessage(row);
+    const cost = estimateTokens(msg);
+    if (budget - cost < 0 && kept.length > (marker ? 1 : 0)) break;
+    budget -= cost;
+    kept.push(msg);
+  }
+
+  if (marker) {
+    const [summary, ...rest] = kept;
+    rest.reverse();
+    return [summary!, ...rest];
+  }
+
+  kept.reverse();
+  return kept;
 }

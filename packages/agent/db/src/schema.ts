@@ -1,5 +1,53 @@
-/** Full SQLite schema for the coding-agent database (v1). */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 3;
+
+export interface Migration {
+  version: number;
+  sql: string;
+}
+
+/**
+ * Ordered list of migrations. Each entry upgrades from (version-1) to version.
+ *
+ * IMPORTANT: When adding a migration, also update SCHEMA_SQL below to include
+ * the same changes. SCHEMA_SQL is the canonical "latest full schema" applied to
+ * fresh databases; migrations handle upgrades from older versions.
+ */
+export const MIGRATIONS: Migration[] = [
+  {
+    version: 2,
+    sql: `
+CREATE TRIGGER IF NOT EXISTS code_chunks_au AFTER UPDATE ON code_chunks BEGIN
+  INSERT INTO code_fts(code_fts, rowid, path, chunk_text, language)
+  VALUES ('delete', old.rowid, old.path, old.chunk_text, old.language);
+  INSERT INTO code_fts(rowid, path, chunk_text, language)
+  VALUES (new.rowid, new.path, new.chunk_text, new.language);
+END;
+`,
+  },
+  {
+    version: 3,
+    sql: `
+CREATE TABLE IF NOT EXISTS skills (
+  name TEXT PRIMARY KEY,
+  description TEXT NOT NULL,
+  instructions TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'builtin',
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS subagent_defs (
+  name TEXT PRIMARY KEY,
+  skill TEXT NOT NULL REFERENCES skills(name),
+  description TEXT NOT NULL,
+  allowed_tools TEXT NOT NULL,
+  max_iterations INTEGER DEFAULT 10,
+  max_cost_usd REAL,
+  source TEXT NOT NULL DEFAULT 'builtin',
+  created_at INTEGER NOT NULL
+);
+`,
+  },
+];
 
 export const SCHEMA_SQL = `
 PRAGMA foreign_keys = ON;
@@ -79,6 +127,13 @@ CREATE TRIGGER IF NOT EXISTS code_chunks_ad AFTER DELETE ON code_chunks BEGIN
   VALUES ('delete', old.rowid, old.path, old.chunk_text, old.language);
 END;
 
+CREATE TRIGGER IF NOT EXISTS code_chunks_au AFTER UPDATE ON code_chunks BEGIN
+  INSERT INTO code_fts(code_fts, rowid, path, chunk_text, language)
+  VALUES ('delete', old.rowid, old.path, old.chunk_text, old.language);
+  INSERT INTO code_fts(rowid, path, chunk_text, language)
+  VALUES (new.rowid, new.path, new.chunk_text, new.language);
+END;
+
 CREATE TABLE IF NOT EXISTS file_tree (
   path TEXT PRIMARY KEY,
   hash TEXT NOT NULL,
@@ -131,4 +186,50 @@ CREATE TABLE IF NOT EXISTS exclude_patterns (
   pattern TEXT PRIMARY KEY,
   source TEXT NOT NULL DEFAULT 'default'
 );
+
+CREATE TABLE IF NOT EXISTS skills (
+  name TEXT PRIMARY KEY,
+  description TEXT NOT NULL,
+  instructions TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'builtin',
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS subagent_defs (
+  name TEXT PRIMARY KEY,
+  skill TEXT NOT NULL REFERENCES skills(name),
+  description TEXT NOT NULL,
+  allowed_tools TEXT NOT NULL,
+  max_iterations INTEGER DEFAULT 10,
+  max_cost_usd REAL,
+  source TEXT NOT NULL DEFAULT 'builtin',
+  created_at INTEGER NOT NULL
+);
 `;
+
+/**
+ * Validate that SCHEMA_SQL and MIGRATIONS don't drift apart.
+ * Call this in tests to ensure every table created by a migration also exists in SCHEMA_SQL.
+ */
+export function validateSchemaConsistency(): { ok: boolean; missing: string[] } {
+  const tableRe = /CREATE TABLE[^(]*?(\w+)\s*\(/gi;
+  const schemaTableNames = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = tableRe.exec(SCHEMA_SQL)) !== null) {
+    schemaTableNames.add(m[1]!.toLowerCase());
+  }
+
+  const missing: string[] = [];
+  for (const migration of MIGRATIONS) {
+    const migRe = /CREATE TABLE[^(]*?(\w+)\s*\(/gi;
+    let mm: RegExpExecArray | null;
+    while ((mm = migRe.exec(migration.sql)) !== null) {
+      const name = mm[1]!.toLowerCase();
+      if (!schemaTableNames.has(name)) {
+        missing.push(`v${migration.version}: table "${name}" not in SCHEMA_SQL`);
+      }
+    }
+  }
+
+  return { ok: missing.length === 0, missing };
+}

@@ -1,4 +1,4 @@
-export const COLORS_ENABLED = !process.env.GENTS_NO_COLOR;
+export const COLORS_ENABLED = !process.env.GENTS_NO_COLOR && !process.env.NO_COLOR;
 
 function dim(s: string): string {
   return COLORS_ENABLED ? `\x1b[2m${s}\x1b[0m` : s;
@@ -15,8 +15,11 @@ function red(s: string): string {
 function cyan(s: string): string {
   return COLORS_ENABLED ? `\x1b[36m${s}\x1b[0m` : s;
 }
+function yellow(s: string): string {
+  return COLORS_ENABLED ? `\x1b[33m${s}\x1b[0m` : s;
+}
 
-export { bold, cyan, dim, green, red };
+export { bold, cyan, dim, green, red, yellow };
 
 export function printToolStart(name: string, input: unknown): void {
   const summary =
@@ -62,4 +65,14 @@ export function printError(msg: string): void {
 
 export function printInfo(msg: string): void {
   process.stdout.write(`${dim(msg)}\n`);
+}
+
+export function printWarn(msg: string): void {
+  process.stderr.write(`${yellow("Warning:")} ${msg}\n`);
+}
+
+export function printDebug(msg: string): void {
+  if (process.env.GENTS_VERBOSE === "1" || process.env.DEBUG) {
+    process.stderr.write(`${dim(`[debug] ${msg}`)}\n`);
+  }
 }

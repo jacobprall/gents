@@ -1,5 +1,6 @@
 /**
  * UUIDv7: 48-bit Unix ms timestamp (big-endian) + version 7 + random bits (RFC 9562).
+ * Uses division instead of bitwise shifts since Date.now() exceeds 32-bit range.
  */
 export function generateUUIDv7(): string {
   const ts = Date.now();
@@ -7,11 +8,11 @@ export function generateUUIDv7(): string {
   crypto.getRandomValues(rnd);
 
   const bytes = new Uint8Array(16);
-  bytes[0] = (ts >> 40) & 0xff;
-  bytes[1] = (ts >> 32) & 0xff;
-  bytes[2] = (ts >> 24) & 0xff;
-  bytes[3] = (ts >> 16) & 0xff;
-  bytes[4] = (ts >> 8) & 0xff;
+  bytes[0] = Math.floor(ts / 2 ** 40) & 0xff;
+  bytes[1] = Math.floor(ts / 2 ** 32) & 0xff;
+  bytes[2] = Math.floor(ts / 2 ** 24) & 0xff;
+  bytes[3] = Math.floor(ts / 2 ** 16) & 0xff;
+  bytes[4] = Math.floor(ts / 2 ** 8) & 0xff;
   bytes[5] = ts & 0xff;
 
   bytes[6] = 0x70 | (rnd[0]! & 0x0f);

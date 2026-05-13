@@ -1,9 +1,5 @@
+import { sqlError } from "./errors";
 import type { AgentDB, SessionMetrics, TurnMetrics } from "./types";
-
-function sqlError(op: string, cause: unknown): Error {
-  const msg = cause instanceof Error ? cause.message : String(cause);
-  return new Error(`${op} failed: ${msg}`);
-}
 
 export function recordTurnMetrics(db: AgentDB, metrics: TurnMetrics): void {
   const createdAt = Date.now();

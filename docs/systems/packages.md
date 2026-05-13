@@ -263,7 +263,7 @@ interface ToolContext {
 }
 
 // Built-in tool factories
-registerBuiltinTools(registry: ToolRegistry, config: BuiltinConfig): void
+registerBuiltinTools(registry: ToolRegistry): void
 ```
 
 ### Built-in Tools

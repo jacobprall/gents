@@ -2,13 +2,9 @@ import { Database } from "bun:sqlite";
 import { dirname, join } from "node:path";
 import { statSync } from "node:fs";
 import { applyBlueprint } from "./blueprint";
+import { sqlError } from "./errors";
 import type { AgentBlueprint, AgentDB, CreateDBOptions } from "./types";
-import { SCHEMA_SQL, SCHEMA_VERSION } from "./schema";
-
-function sqlError(op: string, cause: unknown): Error {
-  const msg = cause instanceof Error ? cause.message : String(cause);
-  return new Error(`${op} failed: ${msg}`);
-}
+import { MIGRATIONS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema";
 
 function extensionCandidates(baseDir: string): string[] {
   const ext = process.platform === "darwin" ? "dylib" : process.platform === "win32" ? "dll" : "so";
@@ -50,18 +46,16 @@ function tryLoadSqliteExtensions(database: Database, modelPath: string): boolean
   return anyLoaded;
 }
 
-function schemaNeedsApply(database: Database): boolean {
+function getCurrentSchemaVersion(database: Database): number {
   try {
     const row = database
       .prepare(`SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'schema_version' LIMIT 1`)
       .get() as { ok: number } | undefined;
-    if (!row) return true;
-    const ver = database.prepare(`SELECT version FROM schema_version WHERE version = ?`).get(SCHEMA_VERSION) as
-      | { version: number }
-      | undefined;
-    return ver === undefined;
+    if (!row) return 0;
+    const ver = database.prepare(`SELECT MAX(version) AS v FROM schema_version`).get() as { v: number | null } | undefined;
+    return ver?.v ?? 0;
   } catch {
-    return true;
+    return 0;
   }
 }
 
@@ -75,9 +69,22 @@ function applySchema(database: Database): void {
   }
 }
 
+function applyMigrations(database: Database, fromVersion: number): void {
+  const pending = MIGRATIONS.filter((m) => m.version > fromVersion).sort((a, b) => a.version - b.version);
+  for (const migration of pending) {
+    try {
+      database.exec(migration.sql);
+      const now = Date.now();
+      database.prepare(`INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)`).run(migration.version, now);
+    } catch (e) {
+      throw sqlError(`applyMigration(v${migration.version})`, e);
+    }
+  }
+}
+
 /**
- * Open or create an agent database. Applies schema when new.
- * If `modelPath` is set, attempts to load native sqlite-vector / sqlite-ai extensions from that directory (non-fatal if missing).
+ * Open or create an agent database. Applies schema when new, runs migrations for existing.
+ * If `modelPath` is set, attempts to load native sqlite-vector / sqlite-ai extensions (non-fatal if missing).
  */
 export function createAgentDB(dbPath: string, opts?: CreateDBOptions): AgentDB {
   let database: Database;
@@ -108,14 +115,18 @@ export function createAgentDB(dbPath: string, opts?: CreateDBOptions): AgentDB {
     }
   }
 
-  let newInstall = false;
-  if (schemaNeedsApply(database)) {
+  const currentVersion = getCurrentSchemaVersion(database);
+  const isNew = currentVersion === 0;
+
+  if (isNew) {
     applySchema(database);
-    newInstall = true;
+  } else if (currentVersion < SCHEMA_VERSION) {
+    applyMigrations(database, currentVersion);
   }
 
   const repoPath = opts?.repoPath ?? "";
-  if (opts?.blueprint != null && newInstall) {
+
+  if (opts?.blueprint != null && isNew) {
     try {
       applyBlueprint({ db: database, repoPath, dbPath, modelLoaded }, opts.blueprint);
     } catch (e) {
@@ -131,18 +142,18 @@ export function createAgentDB(dbPath: string, opts?: CreateDBOptions): AgentDB {
   };
 }
 
-/** Create a database and persist blueprint seed data (tools, permissions, patterns, config, messages). */
+/**
+ * Create a database and persist blueprint seed data.
+ * Only applies blueprint on fresh databases to avoid duplicating seed messages.
+ */
 export function createAgentDBFromBlueprint(
   dbPath: string,
   blueprint: AgentBlueprint,
   opts?: Omit<CreateDBOptions, "blueprint">,
 ): AgentDB {
-  const db = createAgentDB(dbPath, opts);
-  applyBlueprint(db, blueprint);
-  return db;
+  return createAgentDB(dbPath, { ...opts, blueprint });
 }
 
-/** Close the underlying SQLite connection. */
 export function closeAgentDB(agent: AgentDB): void {
   try {
     agent.db.close();

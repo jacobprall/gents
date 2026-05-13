@@ -1,9 +1,5 @@
+import { sqlError } from "./errors";
 import type { AgentDB, FileEntry } from "./types";
-
-function sqlError(op: string, cause: unknown): Error {
-  const msg = cause instanceof Error ? cause.message : String(cause);
-  return new Error(`${op} failed: ${msg}`);
-}
 
 export function getFileTree(db: AgentDB): FileEntry[] {
   try {
