@@ -1,8 +1,9 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Message, MessageCreateParams, TextBlockParam } from "@anthropic-ai/sdk/resources/messages";
-import type { AnthropicMessage, AnthropicSystemBlock, AnthropicToolDef } from "@gents/agent-ctx";
+import type { AnthropicSystemBlock } from "@gents/agent-ctx";
 import { DEFAULT_MAX_TOKENS } from "./types";
 import type { AssistantMessage, TokenUsage } from "./types";
+import type { CompletionParams, LLMProvider, StreamEvent } from "./provider";
 
 const MAX_RETRIES = 3;
 const INITIAL_BACKOFF_MS = 1000;
@@ -22,10 +23,6 @@ async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     signal?.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("Aborted")); }, { once: true });
   });
 }
-
-export type StreamEvent =
-  | { type: "text_delta"; text: string }
-  | { type: "complete"; message: AssistantMessage; usage: TokenUsage };
 
 function asRecord(input: unknown): Record<string, unknown> {
   if (typeof input === "object" && input !== null && !Array.isArray(input)) {
@@ -74,63 +71,56 @@ function systemForSdk(blocks: AnthropicSystemBlock[]): string | TextBlockParam[]
   }));
 }
 
-/** Stream a Messages completion and emit text deltas plus a final structured assistant message. */
-export async function* streamCompletion(
-  client: Anthropic,
-  params: {
-    model: string;
-    system: AnthropicSystemBlock[];
-    messages: AnthropicMessage[];
-    tools: AnthropicToolDef[];
-    maxTokens?: number;
-    maxRetries?: number;
-    signal?: AbortSignal;
-  },
-): AsyncGenerator<StreamEvent> {
-  const body: MessageCreateParams = {
-    model: params.model,
-    system: systemForSdk(params.system),
-    messages: params.messages as MessageCreateParams["messages"],
-    max_tokens: params.maxTokens ?? DEFAULT_MAX_TOKENS,
-    ...(params.tools.length > 0 ? { tools: params.tools as MessageCreateParams["tools"] } : {}),
-  };
+export function createAnthropicProvider(apiKey: string): LLMProvider {
+  const client = new Anthropic({ apiKey });
 
-  const maxRetries = params.maxRetries ?? MAX_RETRIES;
-  let lastError: unknown;
+  async function* stream(params: CompletionParams): AsyncGenerator<StreamEvent> {
+    const body: MessageCreateParams = {
+      model: params.model,
+      system: systemForSdk(params.system),
+      messages: params.messages as MessageCreateParams["messages"],
+      max_tokens: params.maxTokens ?? DEFAULT_MAX_TOKENS,
+      ...(params.tools.length > 0 ? { tools: params.tools as MessageCreateParams["tools"] } : {}),
+    };
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    if (params.signal?.aborted) return;
+    let lastError: unknown;
 
-    if (attempt > 0) {
-      const backoff = INITIAL_BACKOFF_MS * Math.pow(2, attempt - 1) + Math.random() * 500;
-      await sleep(backoff, params.signal);
-    }
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (params.signal?.aborted) return;
 
-    try {
-      const stream = client.messages.stream(body, {
-        signal: params.signal ?? undefined,
-      });
-
-      for await (const event of stream) {
-        if (params.signal?.aborted) {
-          stream.abort();
-          return;
-        }
-        if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
-          yield { type: "text_delta" as const, text: event.delta.text };
-        }
+      if (attempt > 0) {
+        const backoff = INITIAL_BACKOFF_MS * Math.pow(2, attempt - 1) + Math.random() * 500;
+        await sleep(backoff, params.signal);
       }
 
-      const final = await stream.finalMessage();
-      yield { type: "complete" as const, message: assistantFromMessage(final), usage: usageFromMessage(final) };
-      return;
-    } catch (e) {
-      lastError = e;
-      if (!isRetryable(e) || attempt === maxRetries) {
-        throw e;
+      try {
+        const s = client.messages.stream(body, {
+          signal: params.signal ?? undefined,
+        });
+
+        for await (const event of s) {
+          if (params.signal?.aborted) {
+            s.abort();
+            return;
+          }
+          if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
+            yield { type: "text_delta" as const, text: event.delta.text };
+          }
+        }
+
+        const final = await s.finalMessage();
+        yield { type: "complete" as const, message: assistantFromMessage(final), usage: usageFromMessage(final) };
+        return;
+      } catch (e) {
+        lastError = e;
+        if (!isRetryable(e) || attempt === MAX_RETRIES) {
+          throw e;
+        }
       }
     }
+
+    throw lastError;
   }
 
-  throw lastError;
+  return { name: "anthropic", stream };
 }

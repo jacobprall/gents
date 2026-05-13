@@ -1,8 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join as pathJoin } from "node:path";
+import { inferProvider, type ProviderName } from "@gents/agent-loop";
 
 export interface ResolvedConfig {
+  provider: ProviderName;
   apiKey: string;
   model: string;
   maxCostPerSession?: number;
@@ -57,12 +59,41 @@ function readGlobalConfig(key: string): string | undefined {
   }
 }
 
+const PROVIDER_KEY_MAP: Record<ProviderName, { envVar: string; configKey: string; label: string }> = {
+  anthropic: { envVar: "ANTHROPIC_API_KEY", configKey: "anthropic_api_key", label: "Anthropic" },
+  openai: { envVar: "OPENAI_API_KEY", configKey: "openai_api_key", label: "OpenAI" },
+  google: { envVar: "GOOGLE_API_KEY", configKey: "google_api_key", label: "Google" },
+};
+
+function resolveApiKey(provider: ProviderName): string | undefined {
+  const spec = PROVIDER_KEY_MAP[provider];
+  return process.env[spec.envVar] ?? readGlobalConfig(spec.configKey);
+}
+
+/** Returns providers that have a configured API key. */
+export function availableProviders(): ProviderName[] {
+  return (["anthropic", "openai", "google"] as ProviderName[]).filter(
+    (p) => resolveApiKey(p) != null,
+  );
+}
+
 export function resolveConfig(flags: Partial<ResolvedConfig>): ResolvedConfig {
-  const apiKey =
-    flags.apiKey ?? process.env.ANTHROPIC_API_KEY ?? readGlobalConfig("anthropic_api_key");
+  const model =
+    flags.model ??
+    process.env.GENTS_MODEL ??
+    readGlobalConfig("model") ??
+    "claude-sonnet-4-20250514";
+
+  const provider: ProviderName =
+    flags.provider ??
+    (readGlobalConfig("provider") as ProviderName | undefined) ??
+    inferProvider(model);
+
+  const apiKey = flags.apiKey ?? resolveApiKey(provider);
   if (!apiKey) {
+    const spec = PROVIDER_KEY_MAP[provider];
     throw new Error(
-      "No Anthropic API key found. Set ANTHROPIC_API_KEY or run `gents config set anthropic_api_key <key>`",
+      `No ${spec.label} API key found. Set ${spec.envVar} or run \`gents config set ${spec.configKey} <key>\``,
     );
   }
 
@@ -76,12 +107,9 @@ export function resolveConfig(flags: Partial<ResolvedConfig>): ResolvedConfig {
     flags.autoIndex ?? (readGlobalConfig("auto_index") !== "false" && readGlobalConfig("auto_index") !== "0");
 
   return {
+    provider,
     apiKey,
-    model:
-      flags.model ??
-      process.env.GENTS_MODEL ??
-      readGlobalConfig("model") ??
-      "claude-sonnet-4-20250514",
+    model,
     maxCostPerSession: flags.maxCostPerSession ?? (Number.isFinite(maxParsed) && maxParsed > 0 ? maxParsed : undefined),
     confirmDestructive,
     autoIndex,

@@ -1,4 +1,4 @@
-import { createAgentLoop, createChildLoopFactory, type LoopEvent } from "@gents/agent-loop";
+import { createAgentLoop, createChildLoopFactory, type LoopEvent, type ProviderName } from "@gents/agent-loop";
 import {
   closeWorkspaceDB,
   compactConversation,
@@ -37,7 +37,7 @@ import {
   printToolStart,
   printTurnSeparator,
 } from "../display";
-import { resolveConfig } from "../config";
+import { availableProviders, resolveConfig } from "../config";
 import { createDefaultPrompt } from "../prompt";
 import { createRenderer } from "../markdown";
 import { openSession, openWorkspace } from "../session";
@@ -120,11 +120,36 @@ async function confirmationPromptFn(toolName: string, input: unknown): Promise<b
   });
 }
 
+// ── Model catalog for /model command ────────────────────────────────
+
+interface ModelEntry {
+  id: string;
+  label: string;
+  provider: ProviderName;
+}
+
+const MODEL_CATALOG: ModelEntry[] = [
+  // Anthropic
+  { id: "claude-sonnet-4-20250514", label: "Claude Sonnet 4", provider: "anthropic" },
+  { id: "claude-opus-4-20250514", label: "Claude Opus 4", provider: "anthropic" },
+  { id: "claude-3-5-sonnet-20241022", label: "Claude 3.5 Sonnet", provider: "anthropic" },
+  { id: "claude-3-5-haiku-20241022", label: "Claude 3.5 Haiku", provider: "anthropic" },
+  // OpenAI
+  { id: "gpt-4o", label: "GPT-4o", provider: "openai" },
+  { id: "gpt-4o-mini", label: "GPT-4o Mini", provider: "openai" },
+  { id: "o3", label: "o3", provider: "openai" },
+  { id: "o4-mini", label: "o4-mini", provider: "openai" },
+  // Google
+  { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", provider: "google" },
+  { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", provider: "google" },
+  { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash", provider: "google" },
+];
+
 async function handleSlashCommand(
   line: string,
   db: Parameters<typeof getCurrentTurn>[0],
   repoPath: string,
-): Promise<void> {
+): Promise<{ switchModel?: { model: string; provider: ProviderName } } | void> {
   const body = line.slice(1).trim();
   const firstSpace = body.indexOf(" ");
   const cmd = (firstSpace === -1 ? body : body.slice(0, firstSpace)).toLowerCase();
@@ -195,10 +220,57 @@ async function handleSlashCommand(
       printInfo(`  ${muted("session")}  ${String(m.totalTurns)} turns, $${m.totalCostUsd.toFixed(4)}`);
       break;
     }
+    case "model": {
+      return handleModelCommand(argRest);
+    }
     default:
       printError(`Unknown command /${cmd}. Type /help.`);
       break;
   }
+}
+
+function handleModelCommand(
+  argRest: string,
+): { switchModel: { model: string; provider: ProviderName } } | void {
+  const available = availableProviders();
+
+  if (argRest) {
+    const exact = MODEL_CATALOG.find((m) => m.id === argRest || m.label.toLowerCase() === argRest.toLowerCase());
+    if (exact) {
+      if (!available.includes(exact.provider)) {
+        printError(`No API key configured for ${exact.provider}. Run \`gents config set ${exact.provider}_api_key <key>\``);
+        return;
+      }
+      printInfo(`  Switching to ${accent(exact.label)} ${muted(`(${exact.id})`)}`);
+      return { switchModel: { model: exact.id, provider: exact.provider } };
+    }
+    const byProvider = MODEL_CATALOG.filter((m) => m.provider === argRest);
+    if (byProvider.length > 0 && available.includes(argRest as ProviderName)) {
+      printInfo(`  Switching to ${accent(byProvider[0]!.label)} ${muted(`(${byProvider[0]!.id})`)}`);
+      return { switchModel: { model: byProvider[0]!.id, provider: argRest as ProviderName } };
+    }
+    // Treat as a raw model ID
+    printInfo(`  Switching to ${accent(argRest)}`);
+    return { switchModel: { model: argRest, provider: available[0] ?? "anthropic" } };
+  }
+
+  const filtered = MODEL_CATALOG.filter((m) => available.includes(m.provider));
+  if (filtered.length === 0) {
+    printError("No API keys configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY.");
+    return;
+  }
+
+  process.stdout.write("\n");
+  let currentProvider: ProviderName | null = null;
+  for (let i = 0; i < filtered.length; i++) {
+    const entry = filtered[i]!;
+    if (entry.provider !== currentProvider) {
+      currentProvider = entry.provider;
+      process.stdout.write(`  ${accent(currentProvider)}\n`);
+    }
+    process.stdout.write(`    ${muted(String(i + 1) + ".")} ${entry.label} ${muted(`(${entry.id})`)}\n`);
+  }
+  process.stdout.write(`\n  ${muted("Usage: /model <name|number>")}\n\n`);
 }
 
 export const chatCommand = new Command("chat")
@@ -207,6 +279,7 @@ export const chatCommand = new Command("chat")
   .option("--session <id>", "Session ID", "default")
   .option("--new", "Force new session")
   .option("--model <model>", "Override model")
+  .option("--provider <provider>", "LLM provider (anthropic, openai, google)")
   .option("--no-index", "Skip index freshness check")
   .option("--no-confirm", "Skip tool confirmation prompts")
   .action(
@@ -215,6 +288,7 @@ export const chatCommand = new Command("chat")
       session: string;
       new?: boolean;
       model?: string;
+      provider?: string;
       index?: boolean;
       confirm?: boolean;
     }) => {
@@ -222,6 +296,7 @@ export const chatCommand = new Command("chat")
         const repoPath = path.resolve(opts.repo);
         const config = resolveConfig({
           model: opts.model,
+          provider: opts.provider as ProviderName | undefined,
           ...(typeof opts.confirm === "boolean" ? { confirmDestructive: opts.confirm } : {}),
         });
 
@@ -285,15 +360,21 @@ export const chatCommand = new Command("chat")
 
         const prompt = createDefaultPrompt(toolDefs);
 
+        let activeModel = config.model;
+        let activeProvider = config.provider;
+        let activeApiKey = config.apiKey;
+
         const childLoopFactory = createChildLoopFactory({
-          model: config.model,
-          apiKey: config.apiKey,
+          model: activeModel,
+          apiKey: activeApiKey,
+          provider: activeProvider,
           parentRegistry: registry,
         });
 
-        const loop = createAgentLoop({
-          model: config.model,
-          apiKey: config.apiKey,
+        let loop = await createAgentLoop({
+          model: activeModel,
+          apiKey: activeApiKey,
+          provider: activeProvider,
           tools: registry,
           hooks,
           ctx: prompt,
@@ -301,6 +382,25 @@ export const chatCommand = new Command("chat")
           maxCostPerSession: config.maxCostPerSession,
           childLoopFactory,
         });
+
+        async function rebuildLoop(): Promise<void> {
+          loop = await createAgentLoop({
+            model: activeModel,
+            apiKey: activeApiKey,
+            provider: activeProvider,
+            tools: registry,
+            hooks,
+            ctx: prompt,
+            repoPath,
+            maxCostPerSession: config.maxCostPerSession,
+            childLoopFactory: createChildLoopFactory({
+              model: activeModel,
+              apiKey: activeApiKey,
+              provider: activeProvider,
+              parentRegistry: registry,
+            }),
+          });
+        }
 
         if (!interactive) {
           const chunks: string[] = [];
@@ -342,7 +442,8 @@ export const chatCommand = new Command("chat")
         printBanner({
           version: "0.1.0",
           session: opts.session,
-          model: config.model,
+          model: activeModel,
+          provider: activeProvider,
           repoPath,
         });
 
@@ -358,7 +459,23 @@ export const chatCommand = new Command("chat")
               }
 
               if (trimmed.startsWith("/")) {
-                await handleSlashCommand(trimmed, db, repoPath);
+                const result = await handleSlashCommand(trimmed, db, repoPath);
+                if (result && "switchModel" in result && result.switchModel) {
+                  const { model: newModel, provider: newProv } = result.switchModel;
+                  try {
+                    const newConfig = resolveConfig({
+                      model: newModel,
+                      provider: newProv,
+                    });
+                    activeModel = newConfig.model;
+                    activeProvider = newConfig.provider;
+                    activeApiKey = newConfig.apiKey;
+                    await rebuildLoop();
+                    printInfo(muted(`  Now using ${activeModel} via ${activeProvider}`));
+                  } catch (e) {
+                    printError(e instanceof Error ? e.message : String(e));
+                  }
+                }
                 promptUser();
                 return;
               }

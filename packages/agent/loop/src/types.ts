@@ -2,6 +2,7 @@ import type { AgentDB } from "@gents/agent-db";
 import type { Prompt } from "@gents/agent-ctx";
 import type { ToolRegistry, ChildLoopFactory } from "@gents/agent-tools";
 import type { HookPipeline } from "@gents/agent-hooks";
+import type { ProviderName, LLMProvider } from "./provider";
 
 export const DEFAULT_MAX_ITERATIONS = 25;
 export const DEFAULT_MAX_TOKENS = 16_384;
@@ -10,6 +11,8 @@ export const DEFAULT_MAX_TOOL_OUTPUT_BYTES = 100_000;
 export interface LoopConfig {
   model: string;
   apiKey: string;
+  /** LLM provider name or a pre-built LLMProvider instance. Defaults to "anthropic". */
+  provider?: ProviderName | LLMProvider;
   tools: ToolRegistry;
   hooks: HookPipeline;
   ctx: Prompt;

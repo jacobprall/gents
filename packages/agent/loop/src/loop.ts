@@ -1,4 +1,3 @@
-import Anthropic from "@anthropic-ai/sdk";
 import {
   appendEvent,
   appendMessage,
@@ -11,7 +10,7 @@ import {
 import type { HookContext } from "@gents/agent-hooks";
 import { recordCost, recordTokenUsage } from "@gents/agent-otel";
 import type { ToolContext } from "@gents/agent-tools";
-import { streamCompletion } from "./anthropic";
+import { createProvider, type LLMProvider } from "./provider";
 import { calculateCost } from "./cost";
 import {
   executeToolsParallel,
@@ -67,12 +66,14 @@ function extractTransformed(result: { action: string; transformed?: unknown }): 
   return undefined;
 }
 
-export function createAgentLoop(config: LoopConfig): AgentLoop {
+export async function createAgentLoop(config: LoopConfig): Promise<AgentLoop> {
   const workingDir = config.workingDir ?? config.repoPath;
   const maxIter = config.maxIterations ?? DEFAULT_MAX_ITERATIONS;
   const maxToolOutput = config.maxToolOutputBytes ?? DEFAULT_MAX_TOOL_OUTPUT_BYTES;
 
-  const client = new Anthropic({ apiKey: config.apiKey });
+  const provider: LLMProvider = config.provider
+    ? (typeof config.provider === "object" ? config.provider : await createProvider(config.provider, config.apiKey))
+    : await createProvider("anthropic", config.apiKey);
 
   const notify = (e: LoopEvent): LoopEvent => {
     config.onEvent?.(e);
@@ -145,7 +146,7 @@ export function createAgentLoop(config: LoopConfig): AgentLoop {
       let usage = null;
 
       try {
-        for await (const event of streamCompletion(client, {
+        for await (const event of provider.stream({
           model: config.model,
           system: assembled.system,
           messages: assembled.messages,

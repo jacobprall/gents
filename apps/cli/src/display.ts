@@ -206,6 +206,7 @@ export function printBanner(opts: {
   version: string;
   session: string;
   model: string;
+  provider?: string;
   repoPath: string;
 }): void {
   const repo = shortenPath(opts.repoPath);
@@ -214,6 +215,10 @@ export function printBanner(opts: {
   const titleRaw = `gents v${opts.version}`;
   const pad = Math.max(0, Math.floor((25 - titleRaw.length) / 2));
 
+  const modelDisplay = opts.provider && opts.provider !== "anthropic"
+    ? `${opts.model} ${muted(`(${opts.provider})`)}`
+    : opts.model;
+
   process.stdout.write("\n");
   for (const line of BOWTIE) {
     process.stdout.write(line + "\n");
@@ -221,7 +226,7 @@ export function printBanner(opts: {
   process.stdout.write(`  ${" ".repeat(pad)}${title}\n`);
   process.stdout.write("\n");
   process.stdout.write(`  ${muted("session")}  ${opts.session}\n`);
-  process.stdout.write(`  ${muted("model")}    ${opts.model}\n`);
+  process.stdout.write(`  ${muted("model")}    ${modelDisplay}\n`);
   process.stdout.write(`  ${muted("repo")}     ${repo}\n`);
   process.stdout.write("\n");
   process.stdout.write(
@@ -244,6 +249,7 @@ export function printHelp(): void {
   process.stdout.write(cmd("/compact", "[msg]", "Compact conversation history") + "\n");
   process.stdout.write(cmd("/search", " <q>", "Search the codebase index") + "\n");
   process.stdout.write(cmd("/index", "    ", "Rebuild the codebase index") + "\n");
+  process.stdout.write(cmd("/model", " [id]", "List or switch models") + "\n");
   process.stdout.write("\n");
   process.stdout.write(cmd("/cost", "     ", "Session cost and token usage") + "\n");
   process.stdout.write(cmd("/status", "   ", "Index and session status") + "\n");

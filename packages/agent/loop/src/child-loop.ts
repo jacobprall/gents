@@ -5,10 +5,13 @@ import { getConversation } from "@gents/agent-db";
 import { createHookPipeline, costGuard, credentialRedactor, toolGovernance } from "@gents/agent-hooks";
 import { createAgentLoop } from "./loop";
 import type { LoopEvent } from "./types";
+import type { ProviderName, LLMProvider } from "./provider";
 
 export interface CreateChildLoopFactoryConfig {
   model: string;
   apiKey: string;
+  /** LLM provider name or pre-built instance. Inherited from parent loop. */
+  provider?: ProviderName | LLMProvider;
   /** The parent's full tool registry. Child registries are filtered subsets of this. */
   parentRegistry: ToolRegistry;
 }
@@ -60,9 +63,10 @@ export function createChildLoopFactory(config: CreateChildLoopFactoryConfig): Ch
         toolGovernance({ allowedTools: params.allowedTools }),
       ]);
 
-      const childLoop = createAgentLoop({
+      const childLoop = await createAgentLoop({
         model: config.model,
         apiKey: config.apiKey,
+        provider: config.provider,
         tools: childRegistry,
         hooks: childHooks,
         ctx: childPrompt,
@@ -101,7 +105,5 @@ export function createChildLoopFactory(config: CreateChildLoopFactoryConfig): Ch
 }
 
 function trackChildEvent(event: LoopEvent, _onContent: (c: string) => void): void {
-  // Currently a no-op observer. Can be extended to forward events to the parent,
-  // log subagent progress, or stream intermediate results.
   void event;
 }

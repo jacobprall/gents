@@ -38,33 +38,79 @@ function checkBunRuntime(): Check {
   return { label: "Bun runtime", status: "pass", detail: `v${version}`, group: "Runtime" };
 }
 
-function checkApiKey(): Check {
-  if (process.env.ANTHROPIC_API_KEY) {
-    const key = process.env.ANTHROPIC_API_KEY;
-    const masked = `${key.slice(0, 8)}...${key.slice(-4)}`;
-    return { label: "Anthropic API key", status: "pass", detail: `env ANTHROPIC_API_KEY (${masked})`, group: "Auth" };
-  }
+interface ProviderKeySpec {
+  label: string;
+  envVar: string;
+  configKey: string;
+}
 
+const PROVIDER_KEYS: ProviderKeySpec[] = [
+  { label: "Anthropic", envVar: "ANTHROPIC_API_KEY", configKey: "anthropic_api_key" },
+  { label: "OpenAI", envVar: "OPENAI_API_KEY", configKey: "openai_api_key" },
+  { label: "Google", envVar: "GOOGLE_API_KEY", configKey: "google_api_key" },
+];
+
+function maskKey(key: string): string {
+  return `${key.slice(0, 8)}...${key.slice(-4)}`;
+}
+
+function checkApiKeys(): Check[] {
+  let globalRaw: Record<string, unknown> = {};
   const cfgPath = globalConfigPath();
   if (existsSync(cfgPath)) {
     try {
-      const raw = JSON.parse(readFileSync(cfgPath, "utf8")) as Record<string, unknown>;
-      if (typeof raw.anthropic_api_key === "string" && raw.anthropic_api_key.length > 0) {
-        const key = raw.anthropic_api_key;
-        const masked = `${key.slice(0, 8)}...${key.slice(-4)}`;
-        return { label: "Anthropic API key", status: "pass", detail: `config (${masked})`, group: "Auth" };
+      const parsed = JSON.parse(readFileSync(cfgPath, "utf8")) as unknown;
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        globalRaw = parsed as Record<string, unknown>;
       }
-    } catch {
-      /* handled below */
-    }
+    } catch { /* handled by config check */ }
   }
 
-  return {
-    label: "Anthropic API key",
-    status: "fail",
-    detail: "Not found. Set ANTHROPIC_API_KEY or run: gents config set anthropic_api_key <key>",
-    group: "Auth",
-  };
+  const checks: Check[] = [];
+  let anyFound = false;
+
+  for (const spec of PROVIDER_KEYS) {
+    const envVal = process.env[spec.envVar];
+    if (envVal) {
+      checks.push({
+        label: `${spec.label} API key`,
+        status: "pass",
+        detail: `env ${spec.envVar} (${maskKey(envVal)})`,
+        group: "Auth",
+      });
+      anyFound = true;
+      continue;
+    }
+
+    const cfgVal = globalRaw[spec.configKey];
+    if (typeof cfgVal === "string" && cfgVal.length > 0) {
+      checks.push({
+        label: `${spec.label} API key`,
+        status: "pass",
+        detail: `config (${maskKey(cfgVal)})`,
+        group: "Auth",
+      });
+      anyFound = true;
+      continue;
+    }
+
+    checks.push({
+      label: `${spec.label} API key`,
+      status: "warn",
+      detail: `Not found. Set ${spec.envVar} or run: gents config set ${spec.configKey} <key>`,
+      group: "Auth",
+    });
+  }
+
+  if (!anyFound) {
+    checks[0] = {
+      ...checks[0]!,
+      status: "fail",
+      detail: "No API keys found. At least one provider key is required.",
+    };
+  }
+
+  return checks;
 }
 
 function checkGlobalConfig(): Check {
@@ -233,7 +279,7 @@ export const doctorCommand = new Command("doctor")
       checkBunRuntime(),
       await checkGit(),
       checkSqliteExtensions(repoPath),
-      checkApiKey(),
+      ...checkApiKeys(),
       checkGlobalConfig(),
       checkConfigPermissions(),
       checkRepoGentsDir(repoPath),
