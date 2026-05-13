@@ -11,7 +11,7 @@ packages/
   agent/
     db/       @gents/agent-db       SQLite database layer
     loop/     @gents/agent-loop     Agent execution engine
-    ctx/      @gents/agent-ctx      Prompt assembly + LLM caching
+    ctx/      @gents/agent-ctx      Prompt assembly + LLM caching (local)
     tools/    @gents/agent-tools    Tool registry + builtins
     hooks/    @gents/agent-hooks    Middleware pipeline
     otel/     @gents/agent-otel     OpenTelemetry instrumentation
@@ -36,6 +36,7 @@ The foundation. SQLite + extensions for agent state, code search, and conversati
 ```typescript
 // Database lifecycle
 createAgentDB(path: string, opts?: CreateDBOptions): AgentDB
+createAgentDBFromBlueprint(path: string, blueprint: AgentBlueprint, opts?: CreateDBOptions): AgentDB
 closeAgentDB(db: AgentDB): void
 
 // Code indexing
@@ -56,6 +57,10 @@ appendEvent(db: AgentDB, event: NewEvent): Event
 getEvents(db: AgentDB, opts?: EventQueryOptions): Event[]
 getLastEvent(db: AgentDB): Event | null
 
+// Metrics
+recordTurnMetrics(db: AgentDB, metrics: TurnMetrics): void
+getSessionMetrics(db: AgentDB): SessionMetrics
+
 // File tree
 getFileTree(db: AgentDB): FileEntry[]
 getFileTreeDiff(db: AgentDB, repoPath: string): TreeDiff
@@ -64,9 +69,25 @@ getFileTreeDiff(db: AgentDB, repoPath: string): TreeDiff
 getConfig(db: AgentDB, key: string): string | null
 setConfig(db: AgentDB, key: string, value: string): void
 
+// Tools and permissions (from blueprint)
+getEnabledTools(db: AgentDB): ToolDefinition[]
+getPermissions(db: AgentDB): Permission[]
+getExcludePatterns(db: AgentDB): string[]
+
 // Tool cache
 getCachedResult(db: AgentDB, toolName: string, input: string): string | null
 setCachedResult(db: AgentDB, toolName: string, input: string, output: string): void
+
+// Blueprints
+interface AgentBlueprint {
+  name: string
+  tools: ToolDefinition[]
+  permissions: Permission[]
+  excludePatterns: string[]
+  config: Record<string, string>
+  seedMessages?: NewMessage[]
+  systemInstructions?: string
+}
 ```
 
 ### No dependencies on other gents packages.
@@ -402,17 +423,32 @@ interface MCPServer {
 
 ## @gents/sync (Phase 2)
 
-Local-to-cloud bridge.
+Local-to-cloud bridge. Pluggable storage backend for database transfer, event forwarding for dashboard visibility.
 
 ### Dependencies
 - `@gents/agent-db`
+- `@aws-sdk/client-s3` (optional, for S3/R2)
 
 ### Exports
 
 ```typescript
-// Upload/download
-uploadDatabase(db: AgentDB, target: SyncTarget): Promise<string>  // returns URL
-downloadDatabase(url: string, localPath: string): Promise<AgentDB>
+// Storage providers (pluggable)
+interface StorageProvider {
+  upload(localPath: string, key: string): Promise<string>
+  download(key: string, localPath: string): Promise<void>
+  list(prefix: string): Promise<StorageEntry[]>
+  delete(key: string): Promise<void>
+  getSignedUrl?(key: string, expiresIn: number): Promise<string>
+}
+
+createS3Storage(config: S3Config): StorageProvider
+createR2Storage(config: R2Config): StorageProvider
+createGCSStorage(config: GCSConfig): StorageProvider
+createLocalStorage(config: { basePath: string }): StorageProvider
+
+// Database transfer
+uploadDatabase(db: AgentDB, storage: StorageProvider, key: string): Promise<string>
+downloadDatabase(storage: StorageProvider, key: string, localPath: string): Promise<AgentDB>
 
 // Event forwarding
 createEventForwarder(db: AgentDB, gatewayUrl: string, apiKey: string): EventForwarder
@@ -421,12 +457,7 @@ interface EventForwarder {
   start(): void              // begin forwarding new events
   stop(): void
   flush(): Promise<void>     // send all pending events
-}
-
-// Sync targets
-interface SyncTarget {
-  type: "render-storage" | "s3" | "r2"
-  config: Record<string, string>
+  pending(): number          // count of unforwarded events
 }
 ```
 
@@ -434,12 +465,14 @@ interface SyncTarget {
 
 ## @gents/worker (Phase 2)
 
-Durable execution adapter for Render Workflows.
+Durable execution adapter for Render Workflows. Uses livectx for cloud context (infra status, GitHub, CI) alongside agent-db for local data.
 
 ### Dependencies
 - `@gents/agent-db`
 - `@gents/agent-loop`
+- `@gents/agent-ctx`
 - `@gents/sync`
+- `@livectx/core` (for cloud context: infra status, GitHub state, CI results)
 
 ### Exports
 
@@ -448,7 +481,9 @@ Durable execution adapter for Render Workflows.
 executeTask(taskId: string, config: WorkerConfig): Promise<TaskResult>
 
 interface WorkerConfig {
-  databaseUrl?: string       // URL to download existing .agent.db
+  storageKey?: string        // key to pull existing .agent.db from storage
+  storage: StorageProvider   // pluggable storage backend
+  blueprint?: AgentBlueprint // blueprint for new agent databases
   repoUrl: string            // Git repo to clone
   repoToken?: string         // Auth token for clone
   instructions: string       // Task instructions
@@ -459,3 +494,14 @@ interface WorkerConfig {
   apiKey: string
 }
 ```
+
+### Cloud Context via livectx
+
+The worker composes local context (from agent-db via ctx) with cloud context (from external APIs via livectx). livectx bindings handle:
+
+- **Render service status** — deploy state, health checks (SWR cached, 10s staleTime)
+- **GitHub PR/issue state** — labels, reviews, CI checks (push-invalidated via webhooks)
+- **Fleet awareness** — sibling task statuses for coordination (async from Postgres)
+- **Webhook payloads** — incoming event data that triggered the task
+
+This gives cloud agents situational awareness that local agents don't need.

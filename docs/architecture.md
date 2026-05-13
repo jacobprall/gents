@@ -214,6 +214,21 @@ Each package can be used independently. `agent/db` alone is a code search engine
 
 ## Cloud Architecture (Phase 2)
 
+### Context Assembly: Local ctx vs Cloud livectx
+
+The local agent uses the simplified `ctx` layer (synchronous SQLite reads, Anthropic formatting). The cloud worker uses **livectx** (the full library) because the cloud context problem is fundamentally different:
+
+| Concern | Local (ctx) | Cloud (livectx) |
+|---|---|---|
+| Code search | Local SQLite (microseconds) | Local SQLite (same) |
+| Conversation | Local SQLite | Local SQLite |
+| **Infra status** | N/A | Live Render API, deploy status, service health |
+| **GitHub context** | N/A | PR state, review comments, CI status (async, cached) |
+| **Fleet awareness** | N/A | Other task statuses, shared memory (async from Postgres) |
+| **Webhook payloads** | N/A | Incoming event data (push-invalidated) |
+
+livectx's SWR caching, async resolution, push invalidation, and dependency graphs are genuinely valuable for cloud context that comes from external APIs. The `cacheBreakpoint` and sink adapters are shared concerns. So the cloud worker composes both: SQLite-backed bindings (via ctx patterns) for local data, livectx bindings for remote/live data, assembled into a single prompt.
+
 ### Components
 
 | Component | Tech | Role |
@@ -227,22 +242,45 @@ Each package can be used independently. `agent/db` alone is a code search engine
 
 1. **Task creation:** User (CLI, dashboard, or GitHub webhook) creates a task via Gateway API
 2. **Dispatch:** Gateway writes task metadata to Postgres, dispatches Render Workflow
-3. **Execution:** Worker claims task, creates/downloads `.agent.db` on persistent disk, runs agent-loop
+3. **Execution:** Worker claims task, pulls `.agent.db` from storage, runs agent-loop
 4. **Visibility:** Events from agent-db are forwarded to Postgres; dashboard reads via SSE
 5. **Steering:** User sends commands (pause, cancel, redirect) via Gateway → Worker picks them up
-6. **Completion:** Agent finishes, results persisted in database, task marked complete in Postgres
+6. **Completion:** Agent finishes, uploads final `.agent.db` to storage, task marked complete in Postgres
+
+### Storage Backend (Pluggable)
+
+Agent databases are stored and transferred via a pluggable `StorageProvider`:
+
+| Provider | Use Case |
+|---|---|
+| `storage-s3` | AWS S3 — default for production |
+| `storage-r2` | Cloudflare R2 — S3-compatible, no egress fees |
+| `storage-gcs` | Google Cloud Storage |
+| `storage-local` | Local filesystem — for development and single-machine setups |
+
+The storage provider handles upload, download, and listing of `.agent.db` files. The worker pulls the database from storage at task start and pushes it back on completion. This is simpler and more portable than syncing to Postgres — the database file IS the state transfer mechanism.
+
+```typescript
+interface StorageProvider {
+  upload(localPath: string, key: string): Promise<string>   // returns URL
+  download(key: string, localPath: string): Promise<void>
+  list(prefix: string): Promise<StorageEntry[]>
+  delete(key: string): Promise<void>
+}
+```
 
 ### Handoff (Local → Cloud)
 
 ```
 User: gents handoff
-  1. CLI uploads .agent.db to cloud storage
-  2. CLI calls Gateway: POST /tasks with db reference
+  1. CLI uploads .agent.db via StorageProvider
+  2. CLI calls Gateway: POST /tasks with storage key
   3. Gateway dispatches Render Workflow
-  4. Worker downloads .agent.db to persistent disk
+  4. Worker pulls .agent.db from storage to persistent disk
   5. Worker runs agent-loop against the database
   6. Events stream to dashboard via SSE
-  7. User can attach: gents attach <task-id> (stream events back to CLI)
+  7. On completion: worker pushes final .agent.db back to storage
+  8. User can attach: gents attach <task-id> (stream events back to CLI)
 ```
 
 ### Attach (Cloud → Local)
@@ -279,15 +317,56 @@ User: gents fork <task-id>
 
 ---
 
+## Data Modeling (Lessons from openforge-v2)
+
+### Three-Tier Read Pattern
+
+Borrowed from openforge-v2's proven approach: raw events, denormalized current state, and time-bucketed rollups.
+
+| Tier | Local (SQLite) | Cloud (Postgres) | Purpose |
+|---|---|---|---|
+| **Raw events** | `events` table | `task_events` table | Audit, replay, debugging |
+| **Current state** | Computed from last event | `tasks` table (denormalized) | "What's happening now?" |
+| **Time-series rollups** | `metrics` table (per-turn) | `task_metrics_hourly` table | Cost dashboards, trend analysis |
+
+In the local agent-db, the `metrics` table stores per-turn granularity (one row per LLM completion). In cloud Postgres, these are aggregated into hourly buckets for fleet-wide dashboards.
+
+### Single Transactional Write
+
+When appending an event, the agent-db updates all three tiers atomically:
+1. INSERT event into `events`
+2. UPDATE denormalized state (last status, last error, etc.)
+3. UPSERT `metrics` row for the current turn
+
+SQLite's single-writer model makes this trivial (no row locking needed). This mirrors openforge-v2's transactional append pattern but without the `SELECT ... FOR UPDATE` complexity.
+
+### Replayable Projections
+
+The denormalized state can be reconstructed by folding over the event log. This is used for:
+- Fork: copy the database, replay diverges from the fork point
+- Integrity checks: verify denormalized state matches event replay
+- Testing: assert projection logic in isolation
+
+### Cost Tracking
+
+Per openforge-v2's proven model:
+- Budget check BEFORE LLM call (estimate from model + token count)
+- Actual cost recorded AFTER LLM response (from usage metadata)
+- `agent.cost.incurred` event emitted per turn with `model`, `inputTokens`, `outputTokens`, `cachedInputTokens`, `costUsd`
+- Turn count derived from cost event frequency (one cost event = one turn)
+- Canonical USD representation: number (not string) in SQLite, numeric in Postgres
+
+---
+
 ## Sync Strategy (Phase 2+)
 
 Three levels, implemented in order:
 
-### Level 1: REST Upload/Download (Phase 2)
-Simple file transfer. Upload `.agent.db` for handoff. Download for attach/inspect. Works immediately, no infrastructure beyond object storage.
+### Level 1: Storage Upload/Download (Phase 2)
+Transfer `.agent.db` files via the pluggable StorageProvider (S3, R2, GCS, local). Worker pulls on start, pushes on completion. No infrastructure beyond object storage.
 
 ### Level 2: Event Forwarding (Phase 2)
-Agent-db emits events → HTTP POST to Gateway → Postgres insert. Dashboard gets real-time visibility without full database sync. One-directional (agent → cloud).
+Agent-db emits events → HTTP POST to Gateway → Postgres insert with hourly rollup upsert. Dashboard gets real-time visibility without full database sync. One-directional (agent → cloud).
 
 ### Level 3: CRDT Sync (Phase 3, if validated)
 sqlite-sync CRDT replication between local SQLite and cloud Postgres. Bidirectional, conflict-free. Local edits and cloud steering commands merge automatically. Full offline support with eventual consistency.

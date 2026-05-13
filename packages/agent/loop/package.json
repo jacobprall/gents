@@ -1,0 +1,25 @@
+{
+  "name": "@gents/agent-loop",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --external @gents/agent-db --external @gents/agent-ctx --external @gents/agent-tools --external @gents/agent-hooks --external @gents/agent-otel --external @anthropic-ai/sdk --external bun:sqlite",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.96.0",
+    "@gents/agent-ctx": "workspace:*",
+    "@gents/agent-db": "workspace:*",
+    "@gents/agent-hooks": "workspace:*",
+    "@gents/agent-otel": "workspace:*",
+    "@gents/agent-tools": "workspace:*"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "tsup": "^8.0.0",
+    "typescript": "^5.7.0"
+  }
+}

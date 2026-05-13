@@ -177,6 +177,212 @@ CREATE TABLE config (
 
 Keys: `model`, `provider`, `max_turns`, `cost_limit_usd`, `repo_path`, `session_id`.
 
+### metrics
+
+Per-turn cost and usage tracking. One row per LLM completion (maps to openforge-v2's cost.incurred pattern).
+
+```sql
+CREATE TABLE metrics (
+  turn INTEGER PRIMARY KEY,
+  model TEXT,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  tool_calls INTEGER NOT NULL DEFAULT 0,
+  elapsed_ms INTEGER,
+  created_at INTEGER NOT NULL
+);
+```
+
+This table is the local equivalent of openforge-v2's `task_metrics_hourly`. Locally it stores per-turn granularity. When forwarded to the cloud, the Gateway aggregates these into hourly buckets in Postgres for fleet-wide dashboards.
+
+### tools
+
+Pre-loaded tool definitions. When a new agent database is provisioned from a blueprint, this table defines which tools the agent has access to and their configuration.
+
+```sql
+CREATE TABLE tools (
+  name TEXT PRIMARY KEY,
+  definition TEXT NOT NULL,       -- JSON: description, inputSchema
+  enabled INTEGER NOT NULL DEFAULT 1,
+  config TEXT                     -- JSON: tool-specific settings
+);
+```
+
+### permissions
+
+Agent-level permission rules. Pre-loaded from blueprints.
+
+```sql
+CREATE TABLE permissions (
+  id TEXT PRIMARY KEY,
+  type TEXT NOT NULL,              -- 'tool_allow', 'tool_deny', 'path_allow', 'path_deny'
+  pattern TEXT NOT NULL,           -- tool name glob or path glob
+  created_at INTEGER NOT NULL
+);
+```
+
+### exclude_patterns
+
+Patterns for files/directories to exclude from indexing. Pre-loaded with sensible defaults.
+
+```sql
+CREATE TABLE exclude_patterns (
+  pattern TEXT PRIMARY KEY,
+  source TEXT NOT NULL DEFAULT 'default'   -- 'default', 'gitignore', 'user', 'blueprint'
+);
+```
+
+---
+
+## Agent Blueprints
+
+A blueprint is a template for creating new agent databases with pre-configured state. When you provision a new `.agent.db`, you can base it on a blueprint that includes:
+
+- **Tool definitions** — which tools are available and their config
+- **Permissions** — allow/deny rules for tools and paths
+- **Exclude patterns** — what to skip during indexing
+- **Config values** — model, cost limits, preferences
+- **Historical context** — seed conversation or instructions
+- **Custom JS functions** — sqlite-js functions loaded into the database (future, via sqlite-js extension)
+
+```typescript
+interface AgentBlueprint {
+  name: string;
+  tools: ToolDefinition[];
+  permissions: Permission[];
+  excludePatterns: string[];
+  config: Record<string, string>;
+  seedMessages?: Message[];         // pre-loaded conversation context
+  systemInstructions?: string;      // additional system prompt content
+}
+
+// Create a new agent database from a blueprint
+function createAgentDB(dbPath: string, opts: {
+  modelPath?: string;
+  repoPath?: string;
+  blueprint?: AgentBlueprint;
+}): AgentDB;
+```
+
+### Default Blueprint
+
+Every new agent gets sensible defaults even without an explicit blueprint:
+
+```typescript
+const DEFAULT_BLUEPRINT: AgentBlueprint = {
+  name: "default",
+  tools: ALL_BUILTIN_TOOLS,
+  permissions: [
+    { type: "path_deny", pattern: "node_modules/**" },
+    { type: "path_deny", pattern: ".git/**" },
+    { type: "path_deny", pattern: ".env*" },
+  ],
+  excludePatterns: DEFAULT_EXCLUDE_PATTERNS,
+  config: {
+    model: "claude-sonnet-4-20250514",
+    max_turns: "25",
+    cost_limit_usd: "10.00",
+  },
+};
+```
+
+### Custom Blueprints
+
+For cloud tasks triggered by webhooks, different blueprints can be used per task type:
+
+```typescript
+const PR_REVIEW_BLUEPRINT: AgentBlueprint = {
+  name: "pr-review",
+  tools: [FILE_READ, CODE_SEARCH, GIT_DIFF, BASH],  // read-only tools
+  permissions: [
+    { type: "tool_deny", pattern: "file_write" },
+    { type: "tool_deny", pattern: "file_edit" },
+    { type: "tool_deny", pattern: "git_commit" },
+  ],
+  config: {
+    model: "claude-sonnet-4-20250514",
+    cost_limit_usd: "2.00",
+  },
+  systemInstructions: "You are a code reviewer. Analyze the PR diff...",
+};
+```
+
+---
+
+## File Exclusion
+
+### Default Exclude Patterns
+
+Files and directories excluded from indexing by default:
+
+```typescript
+const DEFAULT_EXCLUDE_PATTERNS = [
+  // Package managers
+  "node_modules/**",
+  "vendor/**",
+  ".venv/**",
+  "venv/**",
+  "__pycache__/**",
+  ".pip/**",
+
+  // Build output
+  "dist/**",
+  "build/**",
+  "out/**",
+  ".next/**",
+  ".nuxt/**",
+  "target/**",
+
+  // Version control
+  ".git/**",
+
+  // IDE / editor
+  ".idea/**",
+  ".vscode/**",
+  ".cursor/**",
+
+  // Generated / lock files
+  "*.lock",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+
+  // Binary and media
+  "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.svg",
+  "*.woff", "*.woff2", "*.ttf", "*.eot",
+  "*.mp3", "*.mp4", "*.wav",
+  "*.zip", "*.tar", "*.gz",
+  "*.pdf", "*.doc", "*.docx",
+  "*.exe", "*.dll", "*.so", "*.dylib",
+  "*.wasm",
+
+  // Data files
+  "*.sqlite", "*.db",
+  "*.csv",
+
+  // Environment / secrets
+  ".env*",
+  "*.pem", "*.key",
+
+  // Agent's own directory
+  ".gents/**",
+];
+```
+
+### Exclusion Priority
+
+Patterns are evaluated in order:
+
+1. **Hardcoded** — `.git/**` and `.gents/**` are always excluded
+2. **Default patterns** — the list above, loaded into `exclude_patterns` table
+3. **.gitignore** — parsed from repo root and nested directories
+4. **Blueprint patterns** — additional patterns from the agent blueprint
+5. **User overrides** — `gents index --exclude` or config file
+
+Include patterns (`gents index --include`) can override excludes for specific paths.
+
 ---
 
 ## Operations

@@ -1,0 +1,28 @@
+{
+  "name": "@gents/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "gents": "./src/index.ts"
+  },
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "build": "bun build src/index.ts --outfile dist/gents --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@gents/agent-db": "workspace:*",
+    "@gents/agent-loop": "workspace:*",
+    "@gents/agent-ctx": "workspace:*",
+    "@gents/agent-tools": "workspace:*",
+    "@gents/agent-hooks": "workspace:*",
+    "@gents/agent-otel": "workspace:*",
+    "@gents/agent-mcp": "workspace:*",
+    "commander": "^13.0.0"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "typescript": "^5.7.0"
+  }
+}

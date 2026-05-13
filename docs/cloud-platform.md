@@ -17,6 +17,68 @@ The cloud platform handles these. The same agent loop, the same database, the sa
 
 ---
 
+## livectx in the Cloud
+
+The local agent uses a simplified context layer (`ctx`) because all data is in a local SQLite database — synchronous reads, no caching needed. The cloud worker has a fundamentally different context problem: it needs live data from external services.
+
+### Why livectx Matters Here
+
+Cloud agents need context that doesn't live in their database:
+
+| Context Source | Nature | livectx Feature Used |
+|---|---|---|
+| Render service status | Live, changes during task | SWR cache with short staleTime |
+| GitHub PR state | Updated by external actors | Push invalidation via webhook |
+| CI/CD pipeline results | Async, arrives mid-task | Subscription + cache invalidation |
+| Deploy preview URLs | Created during task | Dependency graph (deploy depends on build) |
+| Other agent task status | Fleet coordination | Async resolution, periodic refresh |
+| Review comments | Arrive during long tasks | Push invalidation via webhook |
+
+livectx's async resolution, SWR caching, dependency graphs, and push invalidation are designed for exactly this: assembling context from multiple remote sources with different freshness requirements.
+
+### Composition: ctx + livectx
+
+The cloud worker composes both layers into a single prompt:
+
+```typescript
+import { definePrompt } from "@gents/agent-ctx";
+import { source, prompt as livePrompt, cacheBreakpoint } from "@livectx/core";
+
+// Local bindings (fast, from SQLite)
+const localSections = [
+  { name: "system", placement: "static", resolve: (db) => systemPrompt },
+  { name: "project", placement: "static", resolve: (db) => getProjectOverview(db) },
+  { name: "conversation", placement: "dynamic", resolve: (db) => getConversation(db) },
+];
+
+// Remote bindings (async, cached via livectx)
+const prState = source({
+  key: ["github", "pr", prNumber],
+  resolver: () => github.pulls.get({ pull_number: prNumber }),
+  staleTime: "30s",
+  placement: "dynamic",
+});
+
+const deployStatus = source({
+  key: ["render", "deploy", serviceId],
+  resolver: () => render.getServiceStatus(serviceId),
+  staleTime: "10s",
+  placement: "dynamic",
+});
+
+const ciResults = source({
+  key: ["github", "checks", headSha],
+  resolver: () => github.checks.listForRef({ ref: headSha }),
+  staleTime: "1m",
+  subscribe: true,  // invalidate on webhook push
+  placement: "dynamic",
+});
+```
+
+The static prefix (system prompt, project overview) uses Anthropic cache_control. Dynamic sections mix local SQLite reads and livectx-resolved remote data. livectx handles the complexity of stale data, retries, and push invalidation so the agent loop doesn't have to.
+
+---
+
 ## Components
 
 ### Gateway (Hono on Bun)
@@ -116,6 +178,41 @@ Steering commands are written to the agent's database (or a command queue table)
 
 ---
 
+## Storage Backend (Pluggable)
+
+Agent databases are transferred between local and cloud via a pluggable `StorageProvider`. This is simpler and more portable than syncing state through Postgres — the database file IS the state transfer mechanism.
+
+```typescript
+interface StorageProvider {
+  upload(localPath: string, key: string): Promise<string>
+  download(key: string, localPath: string): Promise<void>
+  list(prefix: string): Promise<StorageEntry[]>
+  delete(key: string): Promise<void>
+  getSignedUrl?(key: string, expiresIn: number): Promise<string>
+}
+```
+
+### Implementations
+
+| Provider | Config | Use Case |
+|---|---|---|
+| `storage-s3` | `{ bucket, region, credentials }` | AWS — widely supported, mature |
+| `storage-r2` | `{ bucket, accountId, credentials }` | Cloudflare R2 — S3-compatible, zero egress fees |
+| `storage-gcs` | `{ bucket, credentials }` | Google Cloud Storage |
+| `storage-render` | `{ serviceId }` | Render persistent disk (direct mount) |
+| `storage-local` | `{ basePath }` | Local filesystem — dev, single-machine setups |
+
+The storage provider is configured per deployment. A typical Render setup uses S3 or R2. Development uses `storage-local`. The Gateway config specifies which provider to use, and both CLI and Worker resolve the same provider.
+
+### Key Naming Convention
+
+```
+gents/<org>/<project>/<task-id>/agent.db        # Active task database
+gents/<org>/<project>/<task-id>/agent.db.final   # Completed task snapshot
+```
+
+---
+
 ## Handoff Protocol
 
 ### Local → Cloud
@@ -124,16 +221,17 @@ Steering commands are written to the agent's database (or a command queue table)
 User: gents handoff
 
 1. CLI reads current .agent.db
-2. CLI uploads .agent.db to object storage (S3/R2)
+2. CLI uploads .agent.db via StorageProvider
 3. CLI calls: POST /api/tasks
    {
      "type": "handoff",
-     "database_url": "<storage-url>",
+     "storage_key": "gents/org/project/task-id/agent.db",
      "instructions": "Continue from where I left off"
    }
 4. Gateway creates task, dispatches workflow
-5. Worker downloads .agent.db, continues execution
-6. CLI receives task ID, can attach later
+5. Worker pulls .agent.db from storage to persistent disk
+6. Worker runs agent-loop against the database
+7. CLI receives task ID, can attach later
 ```
 
 ### Cloud → Local (Attach)
@@ -203,9 +301,11 @@ User: gents fork [--from <task-id>] [--from <db-path>]
 
 ---
 
-## Event Forwarding
+## Event Forwarding and Data Modeling
 
-The bridge between agent-db (SQLite) and the cloud (Postgres):
+### Three-Tier Read Pattern (from openforge-v2)
+
+Proven pattern carried forward: raw events for audit, denormalized current state for API, time-bucketed rollups for dashboards.
 
 ```
 Agent DB (SQLite)          Gateway             Postgres
@@ -218,6 +318,16 @@ Agent DB (SQLite)          Gateway             Postgres
      │──────────────────────►│                    │
      │                       │  INSERT INTO       │
      │                       │  task_events       │
+     │                       │  (raw events)      │
+     │                       │───────────────────►│
+     │                       │                    │
+     │                       │  UPDATE tasks      │
+     │                       │  (denormalized)    │
+     │                       │───────────────────►│
+     │                       │                    │
+     │                       │  UPSERT            │
+     │                       │  task_metrics_     │
+     │                       │  hourly            │
      │                       │───────────────────►│
      │                       │                    │
      │                       │  SSE broadcast     │
@@ -225,7 +335,79 @@ Agent DB (SQLite)          Gateway             Postgres
      │                       │                    │
 ```
 
-The worker forwards events in batches after each turn. If the network is unavailable (shouldn't happen in cloud, but defensive), events queue locally and forward on recovery.
+### Postgres Schema (Fleet View)
+
+```sql
+-- Tier 1: Raw events (append-only, per-task)
+CREATE TABLE task_events (
+  id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  version SMALLINT NOT NULL DEFAULT 1,
+  ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX idx_task_events_task_ts ON task_events(task_id, ts);
+CREATE INDEX idx_task_events_task_type ON task_events(task_id, type, ts);
+
+-- Tier 2: Denormalized current state (one row per task)
+CREATE TABLE tasks (
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'pending',
+  description TEXT,
+  repo_url TEXT,
+  model TEXT,
+  origin TEXT,                          -- 'cli', 'dashboard', 'webhook', 'api'
+  blueprint TEXT,                       -- which AgentBlueprint was used
+  storage_key TEXT,                     -- location of .agent.db in storage
+  total_input_tokens BIGINT DEFAULT 0,
+  total_output_tokens BIGINT DEFAULT 0,
+  total_cost_usd NUMERIC DEFAULT 0,
+  turn_count INTEGER DEFAULT 0,
+  tool_call_count INTEGER DEFAULT 0,
+  last_error TEXT,
+  created_by TEXT,
+  parent_task_id TEXT,                  -- for forks
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  completed_at TIMESTAMPTZ
+);
+
+-- Tier 3: Time-series rollups (hourly buckets)
+CREATE TABLE task_metrics_hourly (
+  task_id TEXT NOT NULL,
+  hour TIMESTAMPTZ NOT NULL,
+  input_tokens BIGINT NOT NULL DEFAULT 0,
+  output_tokens BIGINT NOT NULL DEFAULT 0,
+  cached_input_tokens BIGINT NOT NULL DEFAULT 0,
+  cost_usd NUMERIC NOT NULL DEFAULT 0,
+  tool_calls INTEGER NOT NULL DEFAULT 0,
+  messages INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (task_id, hour)
+);
+```
+
+### Event Processing in Gateway
+
+On receiving forwarded events, the Gateway executes all three writes in a single transaction:
+
+1. **INSERT** raw event into `task_events`
+2. **UPDATE** `tasks` row with projection (status transitions, cost increments, error tracking)
+3. **UPSERT** `task_metrics_hourly` with bucketed counters
+
+Only three event types feed the hourly rollup (same as openforge-v2):
+- `agent.cost.incurred` → tokens, cost
+- `agent.tool.succeeded` → tool_calls
+- `message.sent` → messages
+
+### Replayable Projections
+
+The `tasks` denormalized row can be reconstructed by replaying `task_events`. This is used for:
+- Fork accounting (reset semantic state, preserve numeric totals)
+- Data integrity verification
+- Migration and schema evolution
+
+The worker forwards events in batches after each turn. If the network is unavailable, events queue locally in the agent-db and forward on recovery.
 
 ---
 
