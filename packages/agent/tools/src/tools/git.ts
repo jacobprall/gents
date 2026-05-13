@@ -2,7 +2,7 @@ import { z } from "zod";
 import { reindexFiles } from "@gents/agent-db";
 import type { ToolDefinition } from "../types.js";
 import type { SpawnResult } from "../utils.js";
-import { truncate, spawnWithTimeout } from "../utils.js";
+import { truncate, spawnWithTimeout, resolveSafePath } from "../utils.js";
 
 function formatGitResult(result: SpawnResult): string {
   const out = [result.stdout, result.stderr].filter(Boolean).join("").trimEnd();
@@ -67,7 +67,17 @@ export const gitCommitTool: ToolDefinition = {
       const lines: string[] = [];
 
       if (files?.length) {
-        const addResult = await spawnWithTimeout(["git", "add", "--", ...files], {
+        const safePaths: string[] = [];
+        for (const f of files) {
+          try {
+            resolveSafePath(context.repoPath, f);
+            safePaths.push(f);
+          } catch (pathErr) {
+            const msg = pathErr instanceof Error ? pathErr.message : String(pathErr);
+            return `Error: invalid file path "${f}": ${msg}`;
+          }
+        }
+        const addResult = await spawnWithTimeout(["git", "add", "--", ...safePaths], {
           cwd: context.workingDir,
           signal: context.signal,
         });

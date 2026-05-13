@@ -189,6 +189,8 @@ function getConversationWithBudget(
   for (const row of rows) {
     const msg = rowToMessage(row);
     const cost = estimateTokens(msg);
+    // Intentionally allow the first real message to exceed the budget; otherwise
+    // the conversation would be empty when a single message is larger than maxTokens.
     if (budget - cost < 0 && kept.length > (marker ? 1 : 0)) break;
     budget -= cost;
     kept.push(msg);

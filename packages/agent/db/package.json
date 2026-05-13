@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "zod": "^3.24.0"
+    "@sqliteai/sqlite-sync": "^1.0.0"
   },
   "devDependencies": {
     "bun-types": "latest",

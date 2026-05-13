@@ -52,5 +52,6 @@ export function inferProvider(model: string): ProviderName {
   for (const [prefix, provider] of MODEL_PREFIXES) {
     if (model.startsWith(prefix)) return provider;
   }
+  console.warn(`[agent-loop] Could not infer provider for model "${model}", defaulting to "anthropic"`);
   return "anthropic";
 }

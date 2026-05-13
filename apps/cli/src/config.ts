@@ -84,10 +84,12 @@ export function resolveConfig(flags: Partial<ResolvedConfig>): ResolvedConfig {
     readGlobalConfig("model") ??
     "claude-sonnet-4-20250514";
 
+  const VALID_PROVIDERS: ProviderName[] = ["anthropic", "openai", "google"];
+  const rawProvider = flags.provider ?? readGlobalConfig("provider");
   const provider: ProviderName =
-    flags.provider ??
-    (readGlobalConfig("provider") as ProviderName | undefined) ??
-    inferProvider(model);
+    rawProvider && VALID_PROVIDERS.includes(rawProvider as ProviderName)
+      ? (rawProvider as ProviderName)
+      : inferProvider(model);
 
   const apiKey = flags.apiKey ?? resolveApiKey(provider);
   if (!apiKey) {

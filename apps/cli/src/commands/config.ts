@@ -8,15 +8,12 @@ import { printError } from "../display";
 function readAll(): Record<string, unknown> {
   const p = globalConfigPath();
   if (!existsSync(p)) return {};
-  try {
-    const parsed = JSON.parse(readFileSync(p, "utf8")) as unknown;
-    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    /* skip */
+  const raw = readFileSync(p, "utf8");
+  const parsed = JSON.parse(raw) as unknown;
+  if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+    return parsed as Record<string, unknown>;
   }
-  return {};
+  throw new Error(`Config file at ${p} contains invalid data (expected a JSON object)`);
 }
 
 function writeAll(data: Record<string, unknown>): void {
@@ -67,7 +64,15 @@ configCommand
     } catch {
       /* keep raw string */
     }
-    const cfg = readAll();
+    let cfg: Record<string, unknown>;
+    try {
+      cfg = readAll();
+    } catch (e) {
+      printError(`Cannot read existing config: ${e instanceof Error ? e.message : String(e)}`);
+      printError("Fix or remove ~/.gents/config.json before setting values.");
+      process.exitCode = 1;
+      return;
+    }
     cfg[key] = stored;
     writeAll(cfg);
   });

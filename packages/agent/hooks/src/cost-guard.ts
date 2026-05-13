@@ -42,5 +42,19 @@ export function costGuard(config: CostGuardConfig): Hook {
     ): Promise<PostHookResult> {
       return evaluateCost(context, config) ?? { action: "continue" };
     },
+    async preTool(
+      context: HookContext,
+      _toolName: string,
+      _input: unknown,
+    ): Promise<PreHookResult> {
+      return evaluateCost(context, config) ?? { action: "continue" };
+    },
+    async postTool(
+      context: HookContext,
+      _toolName: string,
+      _output: string,
+    ): Promise<PostHookResult> {
+      return evaluateCost(context, config) ?? { action: "continue" };
+    },
   };
 }

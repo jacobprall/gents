@@ -11,9 +11,9 @@ function debugWarn(msg: string, cause?: unknown): void {
 function coerceContent(value: unknown): string {
   if (typeof value === "string") return value;
   if (value === undefined || value === null) return "";
-  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
   try {
-    return JSON.stringify(value);
+    return JSON.stringify(value, (_key, v) => typeof v === "bigint" ? String(v) : v);
   } catch (e) {
     debugWarn("coerceContent: JSON.stringify failed on non-primitive value", e);
     return "";

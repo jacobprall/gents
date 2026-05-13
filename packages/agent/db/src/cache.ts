@@ -1,3 +1,7 @@
+/**
+ * Tool-result cache — reserved for future use.
+ * Not currently imported; kept as intentional placeholder infrastructure.
+ */
 import { sqlError } from "./errors";
 import type { AgentDB } from "./types";
 

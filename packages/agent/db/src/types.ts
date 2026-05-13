@@ -10,6 +10,10 @@ export interface WorkspaceDB {
   readonly dbPath: string;
   readonly workspacePath: string;
   readonly modelLoaded: boolean;
+  /** Whether the sqlite-sync extension is loaded. */
+  readonly syncLoaded?: boolean;
+  /** Unique database identity from sqlite-sync's cloudsync_siteid(). */
+  readonly siteId?: string;
   vectorAvailable?: boolean;
 }
 
@@ -18,6 +22,10 @@ export interface AgentDB {
   readonly repoPath: string;
   readonly dbPath: string;
   readonly modelLoaded: boolean;
+  /** Whether the sqlite-sync extension is loaded (enables CRDT sync and site identity). */
+  readonly syncLoaded?: boolean;
+  /** Unique database identity from sqlite-sync's cloudsync_siteid(). Stable across sessions, unique per DB. */
+  readonly siteId?: string;
   /** Shared workspace index. When set, search/index operations use this DB. */
   readonly workspace?: WorkspaceDB;
   /** @deprecated Use workspace.vectorAvailable instead when workspace is set. */

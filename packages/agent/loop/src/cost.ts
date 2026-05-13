@@ -98,7 +98,7 @@ function ratesFor(model: string): ModelRates {
 export function calculateCost(model: string, usage: TokenUsage): number {
   const r = ratesFor(model);
   const cached = usage.cacheReadInputTokens ?? 0;
-  const nonCachedInput = usage.inputTokens - cached;
+  const nonCachedInput = Math.max(0, usage.inputTokens - cached);
   return (
     (nonCachedInput * r.inputPerMTok + usage.outputTokens * r.outputPerMTok + cached * r.cachedInputPerMTok) /
     1_000_000

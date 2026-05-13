@@ -328,3 +328,27 @@ packages:
 - User overrides via CLI flags provide escape hatches
 
 **Priority order:** Hardcoded > Defaults > .gitignore > Blueprint > User overrides. Include patterns can override excludes for specific paths.
+
+---
+
+## Agent Identity via sqlite-sync site_id
+
+**Decision:** Every agent database gets a unique identity from sqlite-sync's `cloudsync_siteid()` rather than a separately generated UUID.
+
+**Rationale:**
+- sqlite-sync assigns a 16-byte `site_id` to each database when the extension is first loaded — auto-generated, persistent, unique per DB
+- This is the same identity used for CRDT replication in Phase 3, so adopting it now avoids a future migration
+- No schema changes needed — `cloudsync_siteid()` is a SQL function, not a table column
+- Survives forks correctly — a forked database gets a new site_id (the extension handles this)
+- The extension is loaded with the same non-fatal pattern as sqlite-vector/sqlite-ai — if it's unavailable, gents works fine without identity tracking
+- One identity primitive serves multiple purposes: storage keys, cloud handoff, cross-referencing, and eventually CRDT sync
+
+**How it works:**
+- `@sqliteai/sqlite-sync` is an optional dependency of `@gents/agent-db`
+- On database creation, `cloudsync_siteid()` is called and the hex-encoded result is stored on the `AgentDB.siteId` / `WorkspaceDB.siteId` field
+- Storage keys use the site_id: `gents/<org>/<project>/<site_id>/agent.db`
+- Locally, human-friendly filenames (`default.agent.db`, `refactor.agent.db`) remain — the site_id is the canonical identity for machine use
+
+**Trade-offs accepted:**
+- Adds a native extension dependency (same pattern as sqlite-vector, non-fatal if missing)
+- site_id is a hex blob string, not a human-readable UUID (but consistent with how sqlite-sync uses it internally)

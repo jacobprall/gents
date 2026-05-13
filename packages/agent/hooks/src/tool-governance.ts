@@ -4,6 +4,7 @@ import type { GovernanceConfig, Hook, HookContext, PreHookResult } from "./types
 const PATH_KEYS = [
   "path",
   "filePath",
+  "filepath",
   "file",
   "filename",
   "target",
@@ -12,6 +13,8 @@ const PATH_KEYS = [
   "src",
   "destination",
   "source",
+  "uri",
+  "url",
 ] as const;
 
 const segmentRegexCache = new Map<string, RegExp>();
@@ -35,6 +38,15 @@ function pathsFromInput(input: unknown): string[] {
   for (const key of PATH_KEYS) {
     const val = obj[key];
     if (typeof val === "string") paths.push(val);
+  }
+  for (const val of Object.values(obj)) {
+    if (typeof val === "object" && val !== null && !Array.isArray(val)) {
+      const nested = val as Record<string, unknown>;
+      for (const key of PATH_KEYS) {
+        const nval = nested[key];
+        if (typeof nval === "string") paths.push(nval);
+      }
+    }
   }
   return paths;
 }
@@ -81,7 +93,7 @@ export function toolGovernance(config: GovernanceConfig): Hook {
             }
           }
           const allowList = paths.allow;
-          if (allowList !== undefined && allowList.length > 0) {
+          if (allowList !== undefined) {
             const ok = allowList.some((pattern) =>
               globMatch(pattern, pathStr),
             );

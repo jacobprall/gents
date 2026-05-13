@@ -62,7 +62,10 @@ function matchesLanguages(filePath: string, langs?: string[]): boolean {
 function matchesPaths(relPath: string, prefixes?: string[]): boolean {
   if (!prefixes?.length) return true;
   const norm = relPath.split(path.sep).join("/");
-  return prefixes.some((p) => norm.startsWith(p.replace(/\\/g, "/")));
+  return prefixes.some((p) => {
+    const prefix = p.replace(/\\/g, "/");
+    return norm === prefix || norm.startsWith(prefix.endsWith("/") ? prefix : prefix + "/");
+  });
 }
 
 async function grepFallback(
@@ -143,11 +146,17 @@ export const codeSearchTool: ToolDefinition = {
           results = validateAndRefreshResults(context.db.workspace, results);
         }
         return formatHybridResults(results);
-      } catch {
-        return await grepFallback(context.repoPath, parsed.query, {
+      } catch (searchErr) {
+        const errMsg = searchErr instanceof Error ? searchErr.message : String(searchErr);
+        const isHarmless = /no such table|no such column|database.*not/.test(errMsg);
+        const fallback = await grepFallback(context.repoPath, parsed.query, {
           ...opts,
           signal: context.signal,
         });
+        if (isHarmless) {
+          return fallback;
+        }
+        return `[warning: index search failed: ${errMsg}]\n${fallback}`;
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

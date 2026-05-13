@@ -17,8 +17,11 @@ export interface ToolExecutorConfig {
 }
 
 function truncateOutput(output: string, maxBytes: number): string {
-  if (output.length <= maxBytes) return output;
-  return output.slice(0, maxBytes) + `\n\n[truncated: output exceeded ${maxBytes} bytes]`;
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(output);
+  if (bytes.byteLength <= maxBytes) return output;
+  const truncated = new TextDecoder().decode(bytes.slice(0, maxBytes));
+  return truncated + `\n\n[truncated: output exceeded ${maxBytes} bytes]`;
 }
 
 function extractTransformed(result: { action: string; transformed?: unknown }): string | undefined {
@@ -93,10 +96,14 @@ export async function* executeToolsParallel(
     }),
   );
 
-  for (const result of results) {
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i];
+    const toolCall = executableCalls[i];
     if (result.status === "rejected") {
       const err = result.reason instanceof Error ? result.reason.message : String(result.reason);
-      yield cfg.onEvent({ type: "tool.error", name: "unknown", error: err });
+      yield cfg.onEvent({ type: "tool.error", name: toolCall.name, error: err });
+      appendMessage(db, { turn, role: "tool", toolCallId: toolCall.id, content: err });
+      appendEvent(db, { type: "tool.error", payload: { tool: toolCall.name, error: err }, turn });
       continue;
     }
 

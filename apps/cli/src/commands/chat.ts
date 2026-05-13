@@ -1,20 +1,23 @@
-import { createAgentLoop, createChildLoopFactory, type LoopEvent, type ProviderName } from "@gents/agent-loop";
+import { createAgentLoop, createChildLoopFactory, inferProvider, type LoopEvent, type ProviderName } from "@gents/agent-loop";
 import {
   closeWorkspaceDB,
   compactConversation,
+  getConfig,
   getCurrentTurn,
   getIndexStatus,
+  getPermissions,
   getSessionMetrics,
   hybridSearch,
   indexCodebase,
   scanSkillDirs,
+  type Permission,
 } from "@gents/agent-db";
 import {
   confirmationGate,
-  costGuard,
   createHookPipeline,
   credentialRedactor,
   toolGovernance,
+  type GovernanceConfig,
 } from "@gents/agent-hooks";
 import { createToolRegistry, registerBuiltinTools } from "@gents/agent-tools";
 import { Command } from "commander";
@@ -118,6 +121,40 @@ async function confirmationPromptFn(toolName: string, input: unknown): Promise<b
       },
     );
   });
+}
+
+function permissionsToGovernance(permissions: Permission[]): GovernanceConfig {
+  const allowedTools: string[] = [];
+  const deniedTools: string[] = [];
+  const pathAllow: string[] = [];
+  const pathDeny: string[] = [];
+
+  for (const p of permissions) {
+    switch (p.type) {
+      case "tool_allow":
+        allowedTools.push(p.pattern);
+        break;
+      case "tool_deny":
+        deniedTools.push(p.pattern);
+        break;
+      case "path_allow":
+        pathAllow.push(p.pattern);
+        break;
+      case "path_deny":
+        pathDeny.push(p.pattern);
+        break;
+    }
+  }
+
+  const config: GovernanceConfig = {};
+  if (allowedTools.length > 0) config.allowedTools = allowedTools;
+  if (deniedTools.length > 0) config.deniedTools = deniedTools;
+  if (pathAllow.length > 0 || pathDeny.length > 0) {
+    config.pathRestrictions = {};
+    if (pathAllow.length > 0) config.pathRestrictions.allow = pathAllow;
+    if (pathDeny.length > 0) config.pathRestrictions.deny = pathDeny;
+  }
+  return config;
 }
 
 // ── Model catalog for /model command ────────────────────────────────
@@ -244,14 +281,14 @@ function handleModelCommand(
       printInfo(`  Switching to ${accent(exact.label)} ${muted(`(${exact.id})`)}`);
       return { switchModel: { model: exact.id, provider: exact.provider } };
     }
-    const byProvider = MODEL_CATALOG.filter((m) => m.provider === argRest);
-    if (byProvider.length > 0 && available.includes(argRest as ProviderName)) {
+    const byProvider = MODEL_CATALOG.filter((m) => m.provider === argRest.toLowerCase());
+    if (byProvider.length > 0 && available.includes(argRest.toLowerCase() as ProviderName)) {
       printInfo(`  Switching to ${accent(byProvider[0]!.label)} ${muted(`(${byProvider[0]!.id})`)}`);
-      return { switchModel: { model: byProvider[0]!.id, provider: argRest as ProviderName } };
+      return { switchModel: { model: byProvider[0]!.id, provider: argRest.toLowerCase() as ProviderName } };
     }
-    // Treat as a raw model ID
+    const inferred = inferProvider(argRest);
     printInfo(`  Switching to ${accent(argRest)}`);
-    return { switchModel: { model: argRest, provider: available[0] ?? "anthropic" } };
+    return { switchModel: { model: argRest, provider: inferred } };
   }
 
   const filtered = MODEL_CATALOG.filter((m) => available.includes(m.provider));
@@ -336,10 +373,17 @@ export const chatCommand = new Command("chat")
 
         const interactive = process.stdin.isTTY ?? false;
 
+        const governanceConfig = permissionsToGovernance(getPermissions(db));
+
+        const maxTurnsRaw = getConfig(db, "max_turns");
+        const maxIterations =
+          maxTurnsRaw != null && Number.isFinite(Number(maxTurnsRaw)) && Number(maxTurnsRaw) > 0
+            ? Number(maxTurnsRaw)
+            : undefined;
+
         const hookList = [
-          costGuard({ maxCostPerSession: config.maxCostPerSession }),
           credentialRedactor(),
-          toolGovernance({}),
+          toolGovernance(governanceConfig),
           ...(config.confirmDestructive && interactive
             ? [
                 confirmationGate({
@@ -379,6 +423,7 @@ export const chatCommand = new Command("chat")
           hooks,
           ctx: prompt,
           repoPath,
+          maxIterations,
           maxCostPerSession: config.maxCostPerSession,
           childLoopFactory,
         });
@@ -392,6 +437,7 @@ export const chatCommand = new Command("chat")
             hooks,
             ctx: prompt,
             repoPath,
+            maxIterations,
             maxCostPerSession: config.maxCostPerSession,
             childLoopFactory: createChildLoopFactory({
               model: activeModel,
@@ -414,10 +460,17 @@ export const chatCommand = new Command("chat")
             process.exit(1);
           }
           printDebug(`Piped input (${String(piped.length)} chars), running single turn`);
-          for await (const event of loop.run(db, piped)) {
-            handleLoopEvent(event);
+          try {
+            for await (const event of loop.run(db, piped)) {
+              handleLoopEvent(event);
+            }
+          } catch (e) {
+            printError(e instanceof Error ? e.message : String(e));
+            process.exitCode = 1;
+          } finally {
+            try { closeWorkspaceDB(workspace); } catch { /* best effort */ }
           }
-          process.exit(0);
+          process.exit(process.exitCode ?? 0);
         }
 
         const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -459,22 +512,26 @@ export const chatCommand = new Command("chat")
               }
 
               if (trimmed.startsWith("/")) {
-                const result = await handleSlashCommand(trimmed, db, repoPath);
-                if (result && "switchModel" in result && result.switchModel) {
-                  const { model: newModel, provider: newProv } = result.switchModel;
-                  try {
-                    const newConfig = resolveConfig({
-                      model: newModel,
-                      provider: newProv,
-                    });
-                    activeModel = newConfig.model;
-                    activeProvider = newConfig.provider;
-                    activeApiKey = newConfig.apiKey;
-                    await rebuildLoop();
-                    printInfo(muted(`  Now using ${activeModel} via ${activeProvider}`));
-                  } catch (e) {
-                    printError(e instanceof Error ? e.message : String(e));
+                try {
+                  const result = await handleSlashCommand(trimmed, db, repoPath);
+                  if (result && "switchModel" in result && result.switchModel) {
+                    const { model: newModel, provider: newProv } = result.switchModel;
+                    try {
+                      const newConfig = resolveConfig({
+                        model: newModel,
+                        provider: newProv,
+                      });
+                      activeModel = newConfig.model;
+                      activeProvider = newConfig.provider;
+                      activeApiKey = newConfig.apiKey;
+                      await rebuildLoop();
+                      printInfo(muted(`  Now using ${activeModel} via ${activeProvider}`));
+                    } catch (e) {
+                      printError(e instanceof Error ? e.message : String(e));
+                    }
                   }
+                } catch (e) {
+                  printError(e instanceof Error ? e.message : String(e));
                 }
                 promptUser();
                 return;

@@ -17,6 +17,10 @@ const BINARY_EXTENSIONS = new Set([
 ]);
 
 // --- Gitignore handling (supports nested .gitignore files) ---
+// NOTE: This is a simplified .gitignore parser and does not fully match git's
+// behavior (e.g. rooted patterns, ** globs, escaped characters). A proper
+// git-compatible parser (or shelling out to `git check-ignore`) would be a
+// future improvement.
 
 interface GitRule {
   pattern: string;
@@ -217,46 +221,68 @@ function indexCodebaseInto(
   );
   const deleteFileStmt = targetDb.prepare(`DELETE FROM file_tree WHERE path = ?`);
 
+  // Phase 1: Read files, hash, and chunk in memory (no DB write lock held)
   const tracked = new Set<string>();
-  const tx = targetDb.transaction(() => {
-    for (const rel of files) {
-      tracked.add(rel);
-      const fullPath = join(repoPath, rel);
-      const prev = prevMap.get(rel);
+  const metaUpdates: { rel: string; hash: string; size: number; mtimeMs: number; language: string | null; indexedAt: number | null }[] = [];
+  const fileUpdates: { rel: string; hash: string; lang: string | null; parts: { startLine: number; endLine: number; text: string }[]; size: number; mtimeMs: number | null }[] = [];
+  const unreadable: string[] = [];
 
-      if (!force && prev) {
-        if (!fileAppearsChanged(fullPath, prev)) continue;
-      }
+  for (const rel of files) {
+    tracked.add(rel);
+    const fullPath = join(repoPath, rel);
+    const prev = prevMap.get(rel);
 
-      let content: string;
-      try {
-        content = readFileSync(fullPath, "utf8");
-      } catch {
-        continue;
-      }
+    if (!force && prev) {
+      if (!fileAppearsChanged(fullPath, prev)) continue;
+    }
 
-      const hash = sha256Hex(content);
-      if (!force && prev && prev.hash === hash) {
-        const st = (() => { try { return statSync(fullPath); } catch { return null; } })();
-        if (st) {
-          upsertFileStmt.run(rel, hash, st.size, Math.trunc(st.mtimeMs), prev.language, prev.indexedAt);
-        }
-        continue;
-      }
+    let content: string;
+    try {
+      content = readFileSync(fullPath, "utf8");
+    } catch {
+      if (prevMap.has(rel)) unreadable.push(rel);
+      continue;
+    }
 
-      filesChanged++;
-      deleteChunksStmt.run(rel);
-
-      const lang = languageFromExt(rel);
-      const parts = chunkFileContent(content, chunkSize, chunkOverlap, minChunk);
-      let idx = 0;
-      for (const part of parts) {
-        insertChunkStmt.run(rel, idx++, part.startLine, part.endLine, lang, part.text);
-        chunksCreated++;
-      }
-
+    const hash = sha256Hex(content);
+    if (!force && prev && prev.hash === hash) {
       const st = (() => { try { return statSync(fullPath); } catch { return null; } })();
-      upsertFileStmt.run(rel, hash, st?.size ?? content.length, st != null ? Math.trunc(st.mtimeMs) : null, lang, now);
+      if (st) {
+        metaUpdates.push({ rel, hash, size: st.size, mtimeMs: Math.trunc(st.mtimeMs), language: prev.language, indexedAt: prev.indexedAt });
+      }
+      continue;
+    }
+
+    filesChanged++;
+    const lang = languageFromExt(rel);
+    const parts = chunkFileContent(content, chunkSize, chunkOverlap, minChunk);
+    chunksCreated += parts.length;
+    const st = (() => { try { return statSync(fullPath); } catch { return null; } })();
+    fileUpdates.push({
+      rel, hash, lang, parts,
+      size: st?.size ?? content.length,
+      mtimeMs: st != null ? Math.trunc(st.mtimeMs) : null,
+    });
+  }
+
+  // Phase 2: Write all collected results to DB in a single transaction
+  const tx = targetDb.transaction(() => {
+    for (const u of metaUpdates) {
+      upsertFileStmt.run(u.rel, u.hash, u.size, u.mtimeMs, u.language, u.indexedAt);
+    }
+
+    for (const u of fileUpdates) {
+      deleteChunksStmt.run(u.rel);
+      let idx = 0;
+      for (const part of u.parts) {
+        insertChunkStmt.run(u.rel, idx++, part.startLine, part.endLine, u.lang, part.text);
+      }
+      upsertFileStmt.run(u.rel, u.hash, u.size, u.mtimeMs, u.lang, now);
+    }
+
+    for (const rel of unreadable) {
+      deleteChunksStmt.run(rel);
+      deleteFileStmt.run(rel);
     }
 
     for (const p of prevMap.keys()) {

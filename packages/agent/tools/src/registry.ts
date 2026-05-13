@@ -26,11 +26,17 @@ export function createToolRegistry(): ToolRegistry {
     },
 
     listForLLM(): AnthropicToolDef[] {
-      return [...tools.values()].map((t) => ({
-        name: t.name,
-        description: t.description,
-        input_schema: zodToJsonSchema(t.inputSchema as z.ZodTypeAny),
-      }));
+      const defs: AnthropicToolDef[] = [];
+      for (const t of tools.values()) {
+        let input_schema: Record<string, unknown>;
+        try {
+          input_schema = zodToJsonSchema(t.inputSchema as z.ZodTypeAny);
+        } catch {
+          input_schema = { type: "object", properties: {} };
+        }
+        defs.push({ name: t.name, description: t.description, input_schema });
+      }
+      return defs;
     },
 
     async execute(name: string, input: unknown, context: ToolContext): Promise<string> {

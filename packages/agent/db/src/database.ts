@@ -13,8 +13,19 @@ function extensionCandidates(baseDir: string): string[] {
     `libsqlite_ai.${ext}`,
     `sqlite_vector.${ext}`,
     `sqlite_ai.${ext}`,
+    `cloudsync.${ext}`,
   ];
   return names.map((n) => join(baseDir, n));
+}
+
+function tryLoadSyncExtension(database: Database): boolean {
+  try {
+    const { getExtensionPath } = require("@sqliteai/sqlite-sync") as { getExtensionPath: () => string };
+    database.loadExtension(getExtensionPath());
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function resolveExtensionBase(modelPath: string): string {
@@ -115,6 +126,13 @@ export function createAgentDB(dbPath: string, opts?: CreateDBOptions): AgentDB {
     }
   }
 
+  let syncLoaded = false;
+  try {
+    syncLoaded = tryLoadSyncExtension(database);
+  } catch {
+    syncLoaded = false;
+  }
+
   const currentVersion = getCurrentSchemaVersion(database);
   const isNew = currentVersion === 0;
 
@@ -134,11 +152,23 @@ export function createAgentDB(dbPath: string, opts?: CreateDBOptions): AgentDB {
     }
   }
 
+  let siteId: string | undefined;
+  if (syncLoaded) {
+    try {
+      const row = database.prepare(`SELECT quote(cloudsync_siteid()) AS sid`).get() as { sid: string } | undefined;
+      if (row?.sid) {
+        siteId = row.sid;
+      }
+    } catch { /* extension loaded but siteid unavailable */ }
+  }
+
   return {
     db: database,
     dbPath,
     repoPath,
     modelLoaded,
+    syncLoaded,
+    siteId,
     workspace: opts?.workspace,
   };
 }

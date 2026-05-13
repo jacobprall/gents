@@ -1,9 +1,9 @@
-import { hybridSearch } from "@gents/agent-db";
+import { closeWorkspaceDB, hybridSearch } from "@gents/agent-db";
 import { Command } from "commander";
 import * as path from "node:path";
 
-import { accent, muted } from "../display";
-import { openSession } from "../session";
+import { accent, muted, printError } from "../display";
+import { openSession, openWorkspace } from "../session";
 
 export const searchCommand = new Command("search")
   .description("Search the codebase")
@@ -20,7 +20,9 @@ export const searchCommand = new Command("search")
       opts: { repo: string; session: string; limit: string; lang?: string; path?: string; json?: boolean },
     ) => {
       const repoPath = path.resolve(opts.repo);
-      const db = openSession(repoPath, { session: opts.session });
+      const workspace = openWorkspace(repoPath);
+      const db = openSession(repoPath, { session: opts.session, workspace });
+      try {
       const limit = Number.parseInt(opts.limit, 10);
       const results = hybridSearch(db, query, {
         limit: Number.isFinite(limit) && limit > 0 ? limit : 20,
@@ -45,5 +47,11 @@ export const searchCommand = new Command("search")
         if (lines.length > 8) process.stdout.write(`${muted("  ...")}\n`);
       }
       if (results.length === 0) process.stdout.write(`${muted("  No results.")}\n`);
+      } catch (e) {
+        printError(e instanceof Error ? e.message : String(e));
+        process.exitCode = 1;
+      } finally {
+        try { closeWorkspaceDB(workspace); } catch { /* best effort */ }
+      }
     },
   );

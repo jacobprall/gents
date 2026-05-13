@@ -20,6 +20,7 @@ export class MarkdownRenderer {
   flush(): void {
     this.drainLines(true);
     if (this.inCodeBlock) {
+      process.stdout.write(`  ${accent("│")}\n`);
       this.inCodeBlock = false;
       this.codeLang = "";
     }

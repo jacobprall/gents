@@ -1,6 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
-import { createAgentDB, createWorkspaceDB, type AgentDB, type WorkspaceDB } from "@gents/agent-db";
+import { createAgentDB, createWorkspaceDB, DEFAULT_BLUEPRINT, type AgentDB, type WorkspaceDB } from "@gents/agent-db";
 
 export function getGentsDir(repoPath: string): string {
   return path.join(repoPath, ".gents");
@@ -38,8 +38,12 @@ export function openSession(
     const archiveDir = path.join(getGentsDir(repoPath), "archive");
     mkdirSync(archiveDir, { recursive: true });
     copyFileSync(dbPath, path.join(archiveDir, archiveName));
-    unlinkSync(dbPath);
+    try {
+      unlinkSync(dbPath);
+    } catch {
+      /* archive exists as safety net if unlink or createAgentDB fails */
+    }
   }
 
-  return createAgentDB(dbPath, { repoPath, workspace: opts?.workspace });
+  return createAgentDB(dbPath, { repoPath, workspace: opts?.workspace, blueprint: DEFAULT_BLUEPRINT });
 }

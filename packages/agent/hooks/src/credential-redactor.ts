@@ -1,4 +1,10 @@
-import type { Hook, HookContext, PostHookResult, RedactorConfig } from "./types";
+import type {
+  Hook,
+  HookContext,
+  PostHookResult,
+  PreHookResult,
+  RedactorConfig,
+} from "./types";
 
 const DEFAULT_PATTERNS: RegExp[] = [
   /sk-[a-zA-Z0-9]{20,}/g,
@@ -13,33 +19,45 @@ const DEFAULT_PATTERNS: RegExp[] = [
   /Bearer\s+[A-Za-z0-9\-._~+/]+=*/g,
 ];
 
-interface PatternSource {
-  source: string;
-  flags: string;
-}
-
-function toSources(patterns: RegExp[]): PatternSource[] {
-  return patterns.map((p) => ({ source: p.source, flags: p.flags }));
+function compilePatterns(patterns: RegExp[]): RegExp[] {
+  return patterns.map((p) => new RegExp(p.source, p.flags));
 }
 
 function applyPatterns(
   text: string,
-  sources: PatternSource[],
+  compiled: RegExp[],
   replacement: string,
 ): string {
   let out = text;
-  for (const { source, flags } of sources) {
-    out = out.replace(new RegExp(source, flags), replacement);
+  for (const re of compiled) {
+    out = out.replace(re, replacement);
   }
   return out;
 }
 
+function redactObject(
+  obj: unknown,
+  compiled: RegExp[],
+  replacement: string,
+): void {
+  if (typeof obj !== "object" || obj === null) return;
+  const record = obj as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    const val = record[key];
+    if (typeof val === "string") {
+      record[key] = applyPatterns(val, compiled, replacement);
+    } else if (typeof val === "object" && val !== null) {
+      redactObject(val, compiled, replacement);
+    }
+  }
+}
+
 export function credentialRedactor(config?: RedactorConfig): Hook {
-  const sources = toSources(config?.patterns ?? DEFAULT_PATTERNS);
+  const compiled = compilePatterns(config?.patterns ?? DEFAULT_PATTERNS);
   const replacement = config?.replacement ?? "[REDACTED]";
 
   function redact(text: string): PostHookResult {
-    const redacted = applyPatterns(text, sources, replacement);
+    const redacted = applyPatterns(text, compiled, replacement);
     return redacted === text
       ? { action: "continue" }
       : { action: "continue", transformed: redacted };
@@ -47,11 +65,22 @@ export function credentialRedactor(config?: RedactorConfig): Hook {
 
   return {
     name: "credential-redactor",
+    async preLLM(_ctx: HookContext): Promise<PreHookResult> {
+      return { action: "continue" };
+    },
     async postLLM(
       _ctx: HookContext,
       responseText: string,
     ): Promise<PostHookResult> {
       return redact(responseText);
+    },
+    async preTool(
+      _ctx: HookContext,
+      _toolName: string,
+      input: unknown,
+    ): Promise<PreHookResult> {
+      redactObject(input, compiled, replacement);
+      return { action: "continue" };
     },
     async postTool(
       _ctx: HookContext,

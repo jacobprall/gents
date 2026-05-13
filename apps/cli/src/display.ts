@@ -19,10 +19,6 @@ function rgb(r: number, g: number, b: number, fallbackCode: string): (s: string)
 export const dim = ansi("2");
 export const bold = ansi("1");
 export const italic = ansi("3");
-export const underline = ansi("4");
-export const strikethrough = ansi("9");
-export const boldDim = (s: string): string =>
-  COLORS_ENABLED ? `\x1b[1;2m${s}\x1b[0m` : s;
 
 // ── Semantic palette ─────────────────────────────────────────────────────
 
@@ -31,13 +27,7 @@ export const success = rgb(129, 199, 132, "32");
 export const error = rgb(239, 154, 154, "31");
 export const warning = rgb(255, 213, 79, "33");
 
-export const green = ansi("32");
-export const red = ansi("31");
-export const cyan = ansi("36");
-export const yellow = ansi("33");
-
 export const muted = dim;
-export const highlight = bold;
 
 // ── Spinner ──────────────────────────────────────────────────────────────
 
@@ -134,8 +124,7 @@ function printDiffLines(lines: string[]): void {
   }
 }
 
-export function printToolError(name: string, err: string): void {
-  void name;
+export function printToolError(_name: string, err: string): void {
   process.stdout.write(`  ${muted("└")} ${error("error:")} ${err}\n\n`);
 }
 

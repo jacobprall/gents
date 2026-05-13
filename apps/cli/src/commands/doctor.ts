@@ -247,6 +247,13 @@ function checkSqliteExtensions(repoPath: string): Check {
       /* not loaded */
     }
 
+    try {
+      db.prepare("SELECT cloudsync_version()").get();
+      exts.push("sqlite-sync");
+    } catch {
+      /* not loaded */
+    }
+
     db.close();
 
     if (exts.length === 0) {

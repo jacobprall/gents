@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, normalize } from "node:path";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { sqlError } from "./errors";
 import type { WorkspaceDB } from "./types";
@@ -31,8 +31,19 @@ function extensionCandidates(baseDir: string): string[] {
     `libsqlite_ai.${ext}`,
     `sqlite_vector.${ext}`,
     `sqlite_ai.${ext}`,
+    `cloudsync.${ext}`,
   ];
   return names.map((n) => join(baseDir, n));
+}
+
+function tryLoadSyncExtension(database: Database): boolean {
+  try {
+    const { getExtensionPath } = require("@sqliteai/sqlite-sync") as { getExtensionPath: () => string };
+    database.loadExtension(getExtensionPath());
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function tryLoadExtensions(database: Database, modelPath: string): boolean {
@@ -96,6 +107,13 @@ export function createWorkspaceDB(
     }
   }
 
+  let syncLoaded = false;
+  try {
+    syncLoaded = tryLoadSyncExtension(database);
+  } catch {
+    syncLoaded = false;
+  }
+
   const currentVersion = getCurrentSchemaVersion(database);
   if (currentVersion === 0) {
     try {
@@ -132,7 +150,17 @@ export function createWorkspaceDB(
     }
   }
 
-  return { db: database, dbPath, workspacePath, modelLoaded };
+  let siteId: string | undefined;
+  if (syncLoaded) {
+    try {
+      const row = database.prepare(`SELECT quote(cloudsync_siteid()) AS sid`).get() as { sid: string } | undefined;
+      if (row?.sid) {
+        siteId = row.sid;
+      }
+    } catch { /* extension loaded but siteid unavailable */ }
+  }
+
+  return { db: database, dbPath, workspacePath, modelLoaded, syncLoaded, siteId };
 }
 
 export function closeWorkspaceDB(ws: WorkspaceDB): void {
@@ -140,6 +168,17 @@ export function closeWorkspaceDB(ws: WorkspaceDB): void {
     ws.db.close();
   } catch (e) {
     throw sqlError("close workspace database", e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Path safety
+// ---------------------------------------------------------------------------
+
+function assertSafeRelPath(relPath: string): void {
+  const norm = normalize(relPath);
+  if (isAbsolute(norm) || norm.startsWith("..")) {
+    throw new Error(`Unsafe relative path: ${relPath}`);
   }
 }
 
@@ -157,6 +196,7 @@ export function reindexFile(
   relPath: string,
   opts?: { content?: string; chunkSize?: number; chunkOverlap?: number },
 ): void {
+  assertSafeRelPath(relPath);
   const chunkSize = opts?.chunkSize ?? 1000;
   const chunkOverlap = opts?.chunkOverlap ?? 150;
   const minChunk = 250;
@@ -215,6 +255,7 @@ export function reindexFile(
  */
 export function reindexFiles(ws: WorkspaceDB, relPaths: string[]): void {
   if (relPaths.length === 0) return;
+  for (const p of relPaths) assertSafeRelPath(p);
   if (relPaths.length === 1) {
     reindexFile(ws, relPaths[0]!);
     return;
@@ -281,6 +322,7 @@ export function reindexFiles(ws: WorkspaceDB, relPaths: string[]): void {
  * Remove a file from the workspace index (e.g. after deletion).
  */
 export function removeFileFromIndex(ws: WorkspaceDB, relPath: string): void {
+  assertSafeRelPath(relPath);
   try {
     const tx = ws.db.transaction(() => {
       ws.db.prepare(`DELETE FROM code_chunks WHERE path = ?`).run(relPath);
@@ -297,6 +339,7 @@ export function removeFileFromIndex(ws: WorkspaceDB, relPath: string): void {
  * Returns true if the file needs re-indexing.
  */
 export function fileIndexStale(ws: WorkspaceDB, relPath: string): boolean {
+  assertSafeRelPath(relPath);
   const row = ws.db
     .prepare(`SELECT hash, size, modified_at FROM file_tree WHERE path = ?`)
     .get(relPath) as { hash: string; size: number | null; modified_at: number | null } | undefined;

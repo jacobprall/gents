@@ -193,11 +193,18 @@ export function createGoogleProvider(apiKey: string): LLMProvider {
                 yield { type: "text_delta" as const, text: part.text };
               }
               if (part.functionCall) {
-                toolCalls.push({
-                  id: part.functionCall.id ?? `call_${toolCalls.length}`,
+                const callId = part.functionCall.id ?? `call_${toolCalls.length}`;
+                const existing = toolCalls.findIndex((tc) => tc.id === callId);
+                const entry = {
+                  id: callId,
                   name: part.functionCall.name ?? "",
                   input: (part.functionCall.args as Record<string, unknown>) ?? {},
-                });
+                };
+                if (existing >= 0) {
+                  toolCalls[existing] = entry;
+                } else {
+                  toolCalls.push(entry);
+                }
               }
             }
           }
