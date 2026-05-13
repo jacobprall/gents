@@ -276,7 +276,7 @@ export const chatCommand = new Command("chat")
         ];
         const hooks = createHookPipeline(hookList);
 
-        const bundledSkillsDir = path.resolve(import.meta.dir, "../../../../skills/bundled");
+        const bundledSkillsDir = path.resolve(import.meta.dir, "../../../../packages/agent/skills/bundled");
         const userSkillsDir = path.join(repoPath, ".gents", "skills");
         scanSkillDirs(db, [
           { dir: bundledSkillsDir, source: "builtin" },

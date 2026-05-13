@@ -103,29 +103,31 @@ Key decisions, their rationale, and alternatives considered.
 
 ## Simplified Context Layer (not full livectx)
 
-**Decision:** Build a minimal prompt assembly system rather than using livectx.
+**Decision:** Build a minimal prompt assembly system (`@gents/agent-ctx`) rather than using livectx for the base layer. Add livectx sources incrementally when the CLI needs live remote data.
 
 **Rationale:**
-- livectx's main value (SWR caching, async fetching, retry) doesn't apply when data is local
-- The remaining value (cache breakpoint, formatting) is ~200 lines of code
-- Fewer abstractions = easier to debug and modify
-- No dependency on an external library that may evolve differently
-- Purpose-built for the specific needs of gents
+- The base prompt layer is purpose-built for gents: declarative sections, static/dynamic placement, cache breakpoint — ~200 lines
+- livectx's async/caching machinery is unnecessary for SQLite-backed sections (microsecond reads)
+- But `definePrompt` already supports async resolvers, so livectx sources can be mixed in without rearchitecting
+- When the CLI needs remote data (Render service status, GitHub PR state, deploy health), livectx sources are added to the sections array and gated on credential availability
+- This avoids a hard split where only the cloud worker gets live data — the CLI can be progressively enhanced
 
-**What we keep from livectx conceptually:**
+**What the base layer provides:**
 - Declarative prompt sections
 - Static/dynamic placement
 - Cache breakpoint for Anthropic prefix caching
 - Clean separation between data resolution and output formatting
+- Async resolver support (ready for livectx sources)
 
-**What we drop:**
-- SWR cache with staleTime/gcTime
-- Async resolvers with retry
+**What livectx adds when used:**
+- SWR cache with staleTime/gcTime for remote API calls
+- Retry and error handling for network requests
+- Push invalidation when webhooks arrive (cloud worker only)
+
+**What we still don't need locally:**
 - Dependency graphs between bindings
-- Push invalidation / subscriptions
 - Multiple sink adapters
 - Template tagged literal DSL
-- General-purpose library design
 
 ---
 
@@ -252,27 +254,29 @@ packages:
 
 ---
 
-## Dual Context Layer: Local ctx + Cloud livectx
+## Dual Context Layer: ctx base + livectx sources
 
-**Decision:** Use a simplified ctx for local agents, full livectx for cloud agents.
+**Decision:** Use `@gents/agent-ctx` as the base prompt layer everywhere. Add `@livectx/core` sources incrementally — in the CLI for optional live data, fully in the cloud worker.
 
 **Rationale:**
-- Local agent reads only from SQLite — livectx's async fetching, SWR caching, and retry are unnecessary overhead
-- Cloud agent needs live data from Render APIs, GitHub, CI pipelines — livectx's features are genuinely valuable here
-- Both share the same cache breakpoint concept for Anthropic prefix caching
-- Composing both in the cloud worker (SQLite bindings via ctx patterns + remote bindings via livectx) gives the best of each
+- The base ctx layer handles prompt structure, caching, and SQLite reads — this is always needed
+- livectx sources slot into the same `definePrompt` sections array via async resolvers
+- The CLI can progressively adopt livectx sources gated on credential availability (e.g., Render API token) — no live data if no credentials, graceful degradation
+- The cloud worker uses livectx fully: SWR caching, push invalidation via webhooks, retry
+- One prompt architecture, graduated levels of live data
 
 **What uses what:**
 
-| Environment | Context Layer | Why |
+| Environment | Context Layer | Live data |
 |---|---|---|
-| CLI (local) | `@gents/agent-ctx` | All data in SQLite, sync reads, no external APIs |
-| Cloud worker | `@gents/agent-ctx` + `@livectx/core` | SQLite for code/conversation, livectx for infra/GitHub/fleet data |
+| CLI (local, no creds) | `@gents/agent-ctx` | SQLite only — skills, conversation, code index |
+| CLI (local, with creds) | `@gents/agent-ctx` + `@livectx/core` | SQLite + optional Render status, GitHub state |
+| Cloud worker | `@gents/agent-ctx` + `@livectx/core` | SQLite + full infra/GitHub/fleet/CI data |
 | Dashboard | N/A (reads Postgres via API) | No prompt assembly needed |
 
 **Trade-offs accepted:**
-- Two context systems to maintain (but ctx is ~200 lines, minimal burden)
-- Cloud worker has more dependencies than local
+- livectx becomes an optional dependency of the CLI (only loaded when API credentials are configured)
+- Two context "modes" in the CLI (local-only vs. local+live) — but the difference is just whether livectx sections are in the array
 - livectx is a vendored dependency (same as openforge-v2 approach)
 
 ---
