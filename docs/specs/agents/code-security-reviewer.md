@@ -6,18 +6,18 @@ A cloud agent that runs on every push and opens GitHub issues when it finds secu
 
 ## Trigger
 
-GitHub `push` webhook → forge routing rule → task creation.
+GitHub `push` webhook → routing rule match → runner dispatch.
 
-One task per push event. The forge service matches the event, resolves the blueprint, and dispatches a cloud worker.
+One task per push event. The Next.js app's webhook handler matches the event against routing rules and launches a runner.
 
 ```
 GitHub push webhook
-  → forge parses event, matches routing rule
+  → Next.js app matches routing rule
   → creates task with code_security_reviewer blueprint
-  → worker spins up, clones repo at pushed ref
+  → runner spins up sandbox, clones repo at pushed ref
   → agent reviews changed files for security issues
   → opens GitHub issue (or comments on PR) if problems found
-  → task completes
+  → task completes, runner exits
 ```
 
 ---
@@ -83,7 +83,7 @@ Minimal — this agent doesn't need much beyond the code:
 | Git diff | dynamic | `git diff` of pushed commits |
 | File contents | dynamic | On-demand via `read_file` |
 
-No livectx needed. This is a stateless, short-lived task that operates on a snapshot.
+Standard ctx layer. This is a stateless, short-lived task that operates on a snapshot.
 
 ---
 
@@ -102,19 +102,17 @@ The built-in tool set covers file reading, grep, and shell commands. Missing:
 
 ---
 
-## Forge Routing Rule
+## Routing Rule
 
 ```typescript
 {
   event: "push",
   filter: {
-    branches: ["main", "develop"],       // or all branches
-    pathPatterns: ["**/*.ts", "**/*.js"], // optional: only trigger on code changes
+    branches: ["main", "develop"],
+    paths: ["**/*.ts", "**/*.js"],
   },
   blueprint: "code-security-reviewer",
-  deduplication: {
-    key: "security-review-{ref}-{after}", // one task per push
-  },
+  instructions: "Review the changes in the latest push for security issues. The diff is available via `git diff HEAD~1`. If you find problems, open a GitHub issue. If everything looks clean, say so and finish.",
 }
 ```
 
@@ -135,7 +133,6 @@ The built-in tool set covers file reading, grep, and shell commands. Missing:
 | Dependency | Phase | Status |
 |---|---|---|
 | AgentBlueprint system | Phase 1 | **Built** |
-| forge service (webhook → task) | Phase 2, M10 | Not built |
-| Gateway + Worker | Phase 2, M8-M9 | Not built |
-| GitHub tools / MCP | Phase 2 | Not built |
-| Cloud sandbox (repo clone) | Phase 2, M8 | Not built |
+| Next.js app (webhook handler + routing rules) | Phase 2, M8 | Not built |
+| Runner package (`@gents/runner`) | Phase 2, M7 | Not built |
+| GitHub API tools | Phase 2 | Not built |

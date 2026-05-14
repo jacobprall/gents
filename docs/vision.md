@@ -12,9 +12,9 @@ In gents, an agent IS its database. Conversation history, code understanding, ev
 
 Locally, the agent works fully offline with sub-millisecond code search powered by sqlite-vector and local embeddings via Nomic Embed. No external services required for the core intelligence loop.
 
-In the cloud, the same agent database runs inside Render durable workflows. Long-running tasks get their own cloud environments with persistent disks. The dashboard shows fleet-wide progress. GitHub webhooks trigger autonomous work.
+In the cloud, a single Next.js app on Render serves as both dashboard and API. It dispatches Render Workflows that provision sandboxes, clone repos, run the agent loop, and report back. GitHub webhooks trigger autonomous work. Teams watch progress and steer running agents from the web or CLI.
 
-The bridge between local and cloud is the database itself. Hand off a task by uploading the `.agent.db` file. Attach to a cloud task by syncing its database back. Fork a task by copying the file.
+The bridge between local and cloud is the Next.js app's API. Dispatch a task from the CLI or dashboard. Attach to a running task to watch its conversation and send steering messages. The same agent loop code runs everywhere.
 
 ---
 
@@ -36,7 +36,7 @@ The bridge between local and cloud is the database itself. Hand off a task by up
 
 1. **A local-first CLI coding agent** that understands your codebase through hybrid semantic + keyword search, maintains conversation context across sessions, and executes code changes autonomously.
 
-2. **A cloud SWE agent platform** that runs long-lived tasks in durable cloud environments, reacts to GitHub events, provisions infrastructure, manages fleet-wide operations, and provides a web dashboard for oversight.
+2. **A cloud task runner with dashboard** that dispatches agents as ephemeral jobs, reacts to GitHub webhooks, provides a web UI for team visibility and steering, and lets multiple people plug into a running agent's conversation.
 
 3. **A composable toolkit** of packages that can be used independently: code search engine, prompt assembly layer, tool execution framework, MCP server.
 

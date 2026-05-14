@@ -7,6 +7,8 @@ interface ModelRates {
 }
 
 const TABLE: Record<string, ModelRates> = {
+  // ── Anthropic Claude 4.6 ───────────────────────────────────────────
+  "claude-sonnet-4-6": { inputPerMTok: 3, outputPerMTok: 15, cachedInputPerMTok: 0.3 },
   // ── Anthropic Claude 4 ─────────────────────────────────────────────
   "claude-sonnet-4-20250514": { inputPerMTok: 3, outputPerMTok: 15, cachedInputPerMTok: 0.3 },
   "claude-opus-4-20250514": { inputPerMTok: 15, outputPerMTok: 75, cachedInputPerMTok: 1.5 },

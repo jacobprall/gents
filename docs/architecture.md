@@ -8,21 +8,24 @@
 ┌─────────────────────────────────────────────────────────────────┐
 │                         CLOUD LAYER                              │
 │                                                                  │
-│  ┌──────────┐  ┌──────────────┐  ┌──────────┐  ┌───────────┐  │
-│  │ Gateway  │  │ Render       │  │  Web     │  │ Postgres  │  │
-│  │ (Hono)   │  │ Workflows    │  │Dashboard │  │ (fleet)   │  │
-│  └──────────┘  └──────────────┘  └──────────┘  └───────────┘  │
+│  ┌───────────────────────────────┐  ┌────────────────────────┐  │
+│  │  Next.js App (Render)         │  │  Render Workflows       │  │
+│  │                               │  │  (the brain)            │  │
+│  │  Dashboard + API + Auth       │  │  agent loop + agent-db  │  │
+│  │  Webhooks + SSE               │  │  LLM calls + ctx        │  │
+│  │  Postgres (tasks, logs)       │  │  ↕ HTTP to sandbox      │  │
+│  └───────────────────────────────┘  └────────────────────────┘  │
 │                                                                  │
 └──────────────────────────────┬──────────────────────────────────┘
                                │
-                         sync / upload
+                      dispatch / attach
                                │
 ┌──────────────────────────────┼──────────────────────────────────┐
 │                        LOCAL LAYER                                │
 │                                                                   │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │                    gents CLI                              │    │
-│  │  chat · search · index · inspect · mcp · handoff         │    │
+│  │  chat · search · index · inspect · mcp · dispatch        │    │
 │  └────────────────────────────┬─────────────────────────────┘    │
 │                               │                                   │
 │  ┌────────────────────────────┼─────────────────────────────┐    │
@@ -61,16 +64,16 @@ Every agent session produces a `.agent.db` file. This file IS the agent — its 
 
 ### Tables
 
-| Table | Purpose | Syncs to Cloud |
-|---|---|---|
-| `messages` | Conversation history (user, assistant, tool messages) | Yes |
-| `compaction_markers` | Summaries replacing old messages when context grows too long | Yes |
-| `events` | Append-only log of everything that happened | Yes |
-| `code_chunks` | Chunked code with embeddings for semantic search | No (rebuild locally) |
-| `code_fts` | FTS5 virtual table over code_chunks for BM25 | No (rebuild locally) |
-| `file_tree` | Filesystem state with content hashes for incremental indexing | No |
-| `tool_cache` | Memoized tool outputs | No |
-| `config` | Agent configuration (model, provider, preferences) | No |
+| Table | Purpose |
+|---|---|
+| `messages` | Conversation history (user, assistant, tool messages) |
+| `compaction_markers` | Summaries replacing old messages when context grows too long |
+| `events` | Append-only log of everything that happened |
+| `code_chunks` | Chunked code with embeddings for semantic search |
+| `code_fts` | FTS5 virtual table over code_chunks for BM25 |
+| `file_tree` | Filesystem state with content hashes for incremental indexing |
+| `tool_cache` | Memoized tool outputs |
+| `config` | Agent configuration (model, provider, preferences) |
 
 ### Hybrid Code Search
 
@@ -139,7 +142,7 @@ A simplified prompt engineering layer focused on two things:
 
 The static prefix (system prompt, project structure, code overview) is identical across turns. Anthropic caches it, saving 30-50% on input tokens over a multi-turn session. The dynamic suffix (current search results, recent conversation) changes each turn.
 
-All section resolvers read from the local SQLite database. Resolution is synchronous and microsecond-fast.
+All section resolvers read from the local SQLite database. Resolution is synchronous and microsecond-fast. Cloud runners use the same ctx layer — no separate context system needed.
 
 ---
 
@@ -205,7 +208,9 @@ agent/hooks      ← depends on nothing (pure middleware)
 agent/otel       ← depends on nothing (instrumentation wrappers)
 agent/loop       ← depends on agent/db, agent/ctx, agent/tools, agent/hooks, agent/otel
 agent/mcp        ← depends on agent/db, agent/tools
+runner           ← depends on agent/loop, agent/db (runs in workflow, calls sandbox over HTTP)
 apps/cli         ← depends on agent/loop, agent/mcp, agent/db
+apps/web         ← depends on WorkflowService, SandboxService, AuthService (Next.js + Postgres)
 ```
 
 Each package can be used independently. `agent/db` alone is a code search engine. `agent/ctx` alone is a prompt formatter. `agent/mcp` alone is an MCP server for code intelligence.
@@ -214,162 +219,173 @@ Each package can be used independently. `agent/db` alone is a code search engine
 
 ## Cloud Architecture (Phase 2)
 
-### Context Assembly: Local ctx vs Cloud livectx
+### Design Principle
 
-The local agent uses the simplified `ctx` layer (synchronous SQLite reads, Anthropic formatting). The cloud worker uses **livectx** (the full library) because the cloud context problem is fundamentally different:
-
-| Concern | Local (ctx) | Cloud (livectx) |
-|---|---|---|
-| Code search | Local SQLite (microseconds) | Local SQLite (same) |
-| Conversation | Local SQLite | Local SQLite |
-| **Infra status** | N/A | Live Render API, deploy status, service health |
-| **GitHub context** | N/A | PR state, review comments, CI status (async, cached) |
-| **Fleet awareness** | N/A | Other task statuses, shared memory (async from Postgres) |
-| **Webhook payloads** | N/A | Incoming event data (push-invalidated) |
-
-livectx's SWR caching, async resolution, push invalidation, and dependency graphs are genuinely valuable for cloud context that comes from external APIs. The `cacheBreakpoint` and sink adapters are shared concerns. So the cloud worker composes both: SQLite-backed bindings (via ctx patterns) for local data, livectx bindings for remote/live data, assembled into a single prompt.
+The same agent loop code runs locally and in cloud workflows. The difference: locally, tools execute on the same machine. In the cloud, the workflow runs the agent loop and tools execute against a remote sandbox over HTTP. The sandbox is stateless and dumb — all intelligence is in the workflow.
 
 ### Components
 
 | Component | Tech | Role |
 |---|---|---|
-| Gateway | Hono on Bun | REST/SSE API, auth, webhook routing, task dispatch |
-| Worker | Render Workflows | Durable agent execution with persistent disk |
-| Dashboard | Next.js | Fleet view, task detail, live event streaming |
-| Postgres | Render managed | Fleet-wide aggregate state (tasks, users, metrics) |
+| Next.js App | Next.js on Render | Dashboard + API routes + webhook handler + auth (one deploy) |
+| WorkflowService | Render Workflows | Durable task orchestration (survives transient failures) |
+| SandboxService | E2B / Fly / Modal (pluggable) | Isolated execution environments (file ops + shell, accessed over HTTP) |
+| AuthService | NextAuth + API keys | User auth and programmatic access |
+| Postgres | Render Managed | Tasks, logs, messages, routing rules |
 
 ### How It Works
 
-1. **Task creation:** User (CLI, dashboard, or GitHub webhook) creates a task via Gateway API
-2. **Dispatch:** Gateway writes task metadata to Postgres, dispatches Render Workflow
-3. **Execution:** Worker claims task, pulls `.agent.db` from storage, runs agent-loop
-4. **Visibility:** Events from agent-db are forwarded to Postgres; dashboard reads via SSE
-5. **Steering:** User sends commands (pause, cancel, redirect) via Gateway → Worker picks them up
-6. **Completion:** Agent finishes, uploads final `.agent.db` to storage, task marked complete in Postgres
-
-### Storage Backend (Pluggable)
-
-Agent databases are stored and transferred via a pluggable `StorageProvider`:
-
-| Provider | Use Case |
-|---|---|
-| `storage-s3` | AWS S3 — default for production |
-| `storage-r2` | Cloudflare R2 — S3-compatible, no egress fees |
-| `storage-gcs` | Google Cloud Storage |
-| `storage-local` | Local filesystem — for development and single-machine setups |
-
-The storage provider handles upload, download, and listing of `.agent.db` files. The worker pulls the database from storage at task start and pushes it back on completion. This is simpler and more portable than syncing to Postgres — the database file IS the state transfer mechanism.
-
-```typescript
-interface StorageProvider {
-  upload(localPath: string, key: string): Promise<string>   // returns URL
-  download(key: string, localPath: string): Promise<void>
-  list(prefix: string): Promise<StorageEntry[]>
-  delete(key: string): Promise<void>
-}
+```
+1. Task creation:
+   - GitHub webhook arrives at Next.js app
+   - OR user dispatches from CLI / dashboard
+2. Next.js app writes task to Postgres, dispatches Render Workflow
+3. Workflow starts:
+   a. Provisions sandbox via SandboxService (E2B, Fly, etc.)
+   b. Clones repo + installs deps in sandbox (commands over HTTP)
+   c. Creates fresh .agent.db locally in the workflow
+   d. Runs agent loop IN THE WORKFLOW:
+      - LLM reasoning + ctx assembly happen in workflow
+      - Tool calls (bash, file ops) execute in sandbox over HTTP
+      - code_search runs locally against agent-db
+4. During execution:
+   - Workflow POSTs events to Next.js app after each turn
+   - Next.js app stores in Postgres, broadcasts via SSE
+   - Users watch from CLI or dashboard
+   - Users can send steering messages (picked up between turns)
+5. On completion:
+   - Workflow reports final result (PR URL, comments posted, etc.)
+   - Optionally uploads .agent.db for later inspection
+   - Sandbox is destroyed via SandboxService
 ```
 
-### Handoff (Local → Cloud)
+### Conversation Tracking and Steering
+
+The conversation lives in the Next.js app's Postgres — not inside the runner's private database. This enables:
+
+- **Multiple viewers** — any team member can watch a running task from CLI or web
+- **Steering** — send messages that the runner picks up between turns
+- **Real-time streaming** — SSE from Next.js app to all connected clients
 
 ```
-User: gents handoff
-  1. CLI uploads .agent.db via StorageProvider
-  2. CLI calls Gateway: POST /tasks with storage key
-  3. Gateway dispatches Render Workflow
-  4. Worker pulls .agent.db from storage to persistent disk
-  5. Worker runs agent-loop against the database
-  6. Events stream to dashboard via SSE
-  7. On completion: worker pushes final .agent.db back to storage
-  8. User can attach: gents attach <task-id> (stream events back to CLI)
+Runner (doing work)              Next.js App              User (CLI or Web)
+       │                              │                         │
+       │  POST /api/tasks/:id/events  │                         │
+       │─────────────────────────────►│                         │
+       │                              │  SSE broadcast          │
+       │                              │────────────────────────►│
+       │                              │                         │
+       │                              │  POST message           │
+       │                              │◄────────────────────────│
+       │                              │                         │
+       │  GET /api/tasks/:id/messages │                         │
+       │◄─────────────────────────────│                         │
+       │                              │                         │
+       │  [injects as next user turn] │                         │
 ```
 
-### Attach (Cloud → Local)
+### Dispatch (Local → Cloud)
+
+```
+User: gents dispatch "Fix the auth tests"
+  1. CLI calls: POST /api/tasks { repo, ref, instructions, blueprint }
+  2. Next.js app creates task in Postgres, dispatches Render Workflow
+  3. Workflow provisions sandbox, runs agent loop (tools execute in sandbox over HTTP)
+  4. CLI receives task ID
+  5. User can attach: gents attach <task-id>
+```
+
+### Attach (Watch + Steer)
 
 ```
 User: gents attach <task-id>
-  1. CLI connects to Gateway SSE endpoint
+  1. CLI connects to: GET /api/tasks/<id>/events (SSE)
   2. Events stream to terminal in real-time
-  3. User can send steering commands (type messages, pause, redirect)
-  4. On completion: CLI can download the .agent.db for local inspection
+  3. User types messages → POST /api/tasks/<id>/messages
+  4. Runner picks up messages next turn
 ```
 
-### Fork
+### Postgres Schema
 
+```sql
+CREATE TABLE tasks (
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'pending',
+  blueprint TEXT,
+  repo TEXT,
+  ref TEXT,
+  instructions TEXT,
+  origin TEXT,              -- 'webhook', 'cli', 'schedule', 'dashboard'
+  workflow_id TEXT,          -- reference to WorkflowService run
+  sandbox_id TEXT,          -- reference to SandboxService instance
+  cost_usd NUMERIC DEFAULT 0,
+  turn_count INTEGER DEFAULT 0,
+  last_error TEXT,
+  created_by TEXT,
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  result JSONB,             -- PR URL, comments posted, errors
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE task_logs (
+  id SERIAL PRIMARY KEY,
+  task_id TEXT REFERENCES tasks(id),
+  type TEXT,                -- 'message', 'tool_call', 'tool_result', 'error', 'status'
+  role TEXT,                -- 'assistant', 'system'
+  content JSONB,
+  ts TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE task_messages (
+  id SERIAL PRIMARY KEY,
+  task_id TEXT REFERENCES tasks(id),
+  content TEXT NOT NULL,
+  sent_by TEXT,
+  picked_up BOOLEAN DEFAULT false,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE routing_rules (
+  id TEXT PRIMARY KEY,
+  event TEXT,               -- 'pull_request.opened', 'push', 'issue.labeled'
+  filter JSONB,             -- branch patterns, label matches, path patterns
+  blueprint TEXT,
+  instructions TEXT,
+  enabled BOOLEAN DEFAULT true
+);
 ```
-User: gents fork <task-id>
-  1. Download the .agent.db at its current state
-  2. Copy to new local file
-  3. Resume with divergent instructions
-  4. Two independent agents with shared history up to fork point
+
+### Infrastructure
+
+```yaml
+# render.yaml
+services:
+  - type: web
+    name: gents
+    runtime: node
+    buildCommand: pnpm build
+    startCommand: pnpm start
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: gents-db
+          property: connectionString
+      - key: GITHUB_APP_PRIVATE_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SANDBOX_PROVIDER
+        value: e2b
+      - key: SANDBOX_API_KEY
+        sync: false
+
+databases:
+  - name: gents-db
+    plan: starter
 ```
 
----
-
-## Services (Phase 2)
-
-| Service | Responsibility |
-|---|---|
-| auth | API key management, GitHub OAuth, JWT middleware |
-| forge | GitHub webhook parsing, routing rules, webhook → task mapping |
-| task | Task CRUD, event pagination, workflow dispatch |
-| sandbox | Cloud environment provisioning (repo clone, dependency install) |
-| deploy | Preview environment management (Render deploy provider) |
-
----
-
-## Data Modeling (Lessons from openforge-v2)
-
-### Three-Tier Read Pattern
-
-Borrowed from openforge-v2's proven approach: raw events, denormalized current state, and time-bucketed rollups.
-
-| Tier | Local (SQLite) | Cloud (Postgres) | Purpose |
-|---|---|---|---|
-| **Raw events** | `events` table | `task_events` table | Audit, replay, debugging |
-| **Current state** | Computed from last event | `tasks` table (denormalized) | "What's happening now?" |
-| **Time-series rollups** | `metrics` table (per-turn) | `task_metrics_hourly` table | Cost dashboards, trend analysis |
-
-In the local agent-db, the `metrics` table stores per-turn granularity (one row per LLM completion). In cloud Postgres, these are aggregated into hourly buckets for fleet-wide dashboards.
-
-### Single Transactional Write
-
-When appending an event, the agent-db updates all three tiers atomically:
-1. INSERT event into `events`
-2. UPDATE denormalized state (last status, last error, etc.)
-3. UPSERT `metrics` row for the current turn
-
-SQLite's single-writer model makes this trivial (no row locking needed). This mirrors openforge-v2's transactional append pattern but without the `SELECT ... FOR UPDATE` complexity.
-
-### Replayable Projections
-
-The denormalized state can be reconstructed by folding over the event log. This is used for:
-- Fork: copy the database, replay diverges from the fork point
-- Integrity checks: verify denormalized state matches event replay
-- Testing: assert projection logic in isolation
-
-### Cost Tracking
-
-Per openforge-v2's proven model:
-- Budget check BEFORE LLM call (estimate from model + token count)
-- Actual cost recorded AFTER LLM response (from usage metadata)
-- `agent.cost.incurred` event emitted per turn with `model`, `inputTokens`, `outputTokens`, `cachedInputTokens`, `costUsd`
-- Turn count derived from cost event frequency (one cost event = one turn)
-- Canonical USD representation: number (not string) in SQLite, numeric in Postgres
-
----
-
-## Sync Strategy (Phase 2+)
-
-Three levels, implemented in order:
-
-### Level 1: Storage Upload/Download (Phase 2)
-Transfer `.agent.db` files via the pluggable StorageProvider (S3, R2, GCS, local). Worker pulls on start, pushes on completion. No infrastructure beyond object storage.
-
-### Level 2: Event Forwarding (Phase 2)
-Agent-db emits events → HTTP POST to Gateway → Postgres insert with hourly rollup upsert. Dashboard gets real-time visibility without full database sync. One-directional (agent → cloud).
-
-### Level 3: CRDT Sync (Phase 3, if validated)
-sqlite-sync CRDT replication between local SQLite and cloud Postgres. Bidirectional, conflict-free. Local edits and cloud steering commands merge automatically. Full offline support with eventual consistency.
+One web service. One database. Workflows orchestrate execution via Render Workflows. Sandboxes are provisioned externally via the SandboxService abstraction.
 
 ---
 
@@ -381,8 +397,7 @@ sqlite-sync CRDT replication between local SQLite and cloud Postgres. Bidirectio
 - Credential redaction scrubs secrets from LLM context
 
 ### Cloud
-- GitHub OAuth for user authentication
-- JWT tokens for API access
-- API key auth for programmatic access
-- Per-user and per-project permission policies
-- Sandbox isolation for agent execution environments
+- GitHub OAuth via NextAuth for user authentication
+- API key auth for CLI and programmatic access
+- Runner sandboxes are isolated (ephemeral containers, destroyed on completion)
+- Secrets injected into runners via environment variables, never stored in Postgres

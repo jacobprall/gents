@@ -7,12 +7,9 @@
 
 ## Architecture Decision
 
-- **CLI (local):** Render/GitHub data via on-demand **tools** — fits the "agent = function over DB" model
-- **Cloud worker (Phase 2):** Render/GitHub data via **livectx prompt context** — ambient awareness for long-running tasks
+- **Everywhere (CLI + cloud runners):** Render/GitHub data via on-demand **tools** — fits the "agent = function over DB" model
 
-Tools are the right abstraction locally because: the agent decides when to fetch, results flow through the normal tool-call/response cycle, and no second data plane is needed.
-
-livectx introduces a second source of truth with its own lifecycle (SWR cache, push invalidation, subscriptions). That complexity is justified in the cloud worker where agents are long-running and need ambient infrastructure awareness. For the CLI — short sessions, user-driven queries — on-demand tools are simpler and fit the existing "agent = stateless function over DB" model.
+Tools are the right abstraction because: the agent decides when to fetch, results flow through the normal tool-call/response cycle, and no second data plane is needed. This applies equally to the local CLI and cloud runners — one pattern everywhere.
 
 ---
 
@@ -95,7 +92,7 @@ Pass `renderApiKey` through to the tool context when creating the agent loop.
 
 ### 6. Update tech-decisions.md
 
-Add a brief note under the "Dual Context Layer" section documenting the decision: tools for CLI, livectx for cloud worker.
+Add a brief note documenting the decision: tools for remote data access everywhere (CLI and cloud runners).
 
 ---
 
@@ -109,30 +106,26 @@ Add a brief note under the "Dual Context Layer" section documenting the decision
 | `packages/agent/tools/src/tools/render.ts` | **New** — 3 Render tool definitions |
 | `packages/agent/tools/src/register-builtins.ts` | Export `renderTools` array (not auto-registered) |
 | `apps/cli/src/commands/chat.ts` | Conditional Render tool registration + context wiring |
-| `docs/tech-decisions.md` | Document tools-local / livectx-cloud split |
+| `docs/tech-decisions.md` | Document tools-everywhere decision |
 
 ---
 
 ## Not in scope
 
 - GitHub API tools (follow-up)
-- livectx integration in CLI prompt (deferred to cloud worker)
-- Render MCP server (Phase 2)
 - `render_scale_service`, `render_create_preview`, or any write/mutating operations (start read-only)
 
 ---
 
-## Future: Cloud Worker with livectx
+## Future: Additional Render Tools
 
-When the cloud worker is built, the same Render API calls will be wrapped as livectx `source()` bindings instead of tools:
+When cloud runners are built, they'll use the same Render API tools. Additional mutating tools can be added:
 
-```typescript
-const renderServices = source({
-  key: ["render", "services"],
-  fetch: async () => renderApi.listServices(apiKey),
-  staleTime: "30s",
-  gcTime: "5m",
-});
-```
+| Tool | Purpose |
+|---|---|
+| `render_scale_service` | Change instance count/plan |
+| `render_restart_service` | Restart a service |
+| `render_create_preview` | Spin up preview env for a branch/PR |
+| `render_delete_preview` | Tear down preview env |
 
-These will be injected as dynamic prompt sections via `definePrompt`, giving cloud agents ambient infrastructure awareness on every turn without explicit tool calls. The Render API client (`render-api.ts`) will be shared between the tool layer and the livectx layer.
+The Render API client (`render-api.ts`) is shared between local CLI tools and cloud runner tools — same code, same patterns.

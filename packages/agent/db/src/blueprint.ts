@@ -7,6 +7,7 @@ export const DEFAULT_EXCLUDE_PATTERNS: string[] = [
   "**/node_modules/**",
   "**/vendor/**",
   "**/.git/**",
+  "**/.gents/**",
   "**/dist/**",
   "**/build/**",
   "**/out/**",

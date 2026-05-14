@@ -11,13 +11,12 @@ packages/
   agent/
     db/       @gents/agent-db       SQLite database layer
     loop/     @gents/agent-loop     Agent execution engine
-    ctx/      @gents/agent-ctx      Prompt assembly + LLM caching (local)
+    ctx/      @gents/agent-ctx      Prompt assembly + LLM caching
     tools/    @gents/agent-tools    Tool registry + builtins
     hooks/    @gents/agent-hooks    Middleware pipeline
     otel/     @gents/agent-otel     OpenTelemetry instrumentation
     mcp/      @gents/agent-mcp      MCP server (internal + external)
-  sync/       @gents/sync           Local <> Cloud bridge (phase 2)
-  worker/     @gents/worker         Durable cloud execution (phase 2)
+  runner/     @gents/runner         Headless cloud execution (phase 2)
 ```
 
 ---
@@ -421,87 +420,171 @@ interface MCPServer {
 
 ---
 
-## @gents/sync (Phase 2)
+## @gents/runner (Phase 2)
 
-Local-to-cloud bridge. Pluggable storage backend for database transfer, event forwarding for dashboard visibility.
-
-### Dependencies
-- `@gents/agent-db`
-- `@aws-sdk/client-s3` (optional, for S3/R2)
-
-### Exports
-
-```typescript
-// Storage providers (pluggable)
-interface StorageProvider {
-  upload(localPath: string, key: string): Promise<string>
-  download(key: string, localPath: string): Promise<void>
-  list(prefix: string): Promise<StorageEntry[]>
-  delete(key: string): Promise<void>
-  getSignedUrl?(key: string, expiresIn: number): Promise<string>
-}
-
-createS3Storage(config: S3Config): StorageProvider
-createR2Storage(config: R2Config): StorageProvider
-createGCSStorage(config: GCSConfig): StorageProvider
-createLocalStorage(config: { basePath: string }): StorageProvider
-
-// Database transfer
-uploadDatabase(db: AgentDB, storage: StorageProvider, key: string): Promise<string>
-downloadDatabase(storage: StorageProvider, key: string, localPath: string): Promise<AgentDB>
-
-// Event forwarding
-createEventForwarder(db: AgentDB, gatewayUrl: string, apiKey: string): EventForwarder
-
-interface EventForwarder {
-  start(): void              // begin forwarding new events
-  stop(): void
-  flush(): Promise<void>     // send all pending events
-  pending(): number          // count of unforwarded events
-}
-```
-
----
-
-## @gents/worker (Phase 2)
-
-Durable execution adapter for Render Workflows. Uses livectx for cloud context (infra status, GitHub, CI) alongside agent-db for local data.
+Agent execution for Render Workflows. The runner runs the agent loop **inside the workflow** and executes tools against a remote sandbox over HTTP. Optionally composes livectx bindings for custom agents that need live awareness.
 
 ### Dependencies
 - `@gents/agent-db`
 - `@gents/agent-loop`
 - `@gents/agent-ctx`
-- `@gents/sync`
-- `@livectx/core` (for cloud context: infra status, GitHub state, CI results)
+- `@gents/agent-tools`
+- `@gents/agent-hooks`
+- `@livectx/core` (optional, for custom agents with live context)
 
 ### Exports
 
 ```typescript
-// Worker entry point
-executeTask(taskId: string, config: WorkerConfig): Promise<TaskResult>
+// Runner entry point (called inside a Render Workflow)
+runTask(spec: RunnerSpec, sandbox: Sandbox): Promise<TaskResult>
 
-interface WorkerConfig {
-  storageKey?: string        // key to pull existing .agent.db from storage
-  storage: StorageProvider   // pluggable storage backend
-  blueprint?: AgentBlueprint // blueprint for new agent databases
-  repoUrl: string            // Git repo to clone
-  repoToken?: string         // Auth token for clone
-  instructions: string       // Task instructions
-  model?: string
-  maxIterations?: number
-  costLimit?: number
-  gatewayUrl: string         // For event forwarding
-  apiKey: string
+// Spec provided when dispatching a workflow
+interface RunnerSpec {
+  taskId: string
+  repo: string
+  ref: string
+  blueprint: string
+  instructions: string
+  callbackUrl: string         // POST events back here
+  constraints: {
+    maxTurns: number
+    maxCostUsd: number
+    timeoutMinutes: number
+  }
+  secrets: {
+    anthropicKey: string
+    githubToken: string
+  }
+  preserveDb?: boolean        // upload agent.db on completion for debugging
+  livectx?: LivectxConfig     // opt-in live context for custom agents
+}
+
+interface TaskResult {
+  status: "completed" | "failed" | "cancelled" | "timeout"
+  turnCount: number
+  costUsd: number
+  result?: Record<string, unknown>  // PR URL, comments posted, etc.
+  error?: string
+}
+
+// Sandbox interface (remote execution over HTTP)
+interface Sandbox {
+  id: string
+  url: string
+  exec(command: string, opts?: { cwd?: string; timeout?: number }): Promise<ExecResult>
+  readFile(path: string): Promise<string>
+  writeFile(path: string, content: string): Promise<void>
+  listDir(path: string, opts?: { recursive?: boolean }): Promise<DirEntry[]>
+}
+
+interface ExecResult {
+  exitCode: number
+  stdout: string
+  stderr: string
+}
+
+// Service abstractions (used by the Next.js app)
+interface SandboxService {
+  create(config: SandboxConfig): Promise<Sandbox>
+  destroy(sandboxId: string): Promise<void>
+}
+
+interface WorkflowService {
+  dispatch(spec: RunnerSpec): Promise<{ workflowId: string }>
+  getStatus(workflowId: string): Promise<WorkflowStatus>
+  cancel(workflowId: string): Promise<void>
+}
+
+// Remote tool registry (tools execute against sandbox over HTTP)
+createRemoteToolRegistry(sandbox: Sandbox): ToolRegistry
+
+// Event reporting
+interface EventReporter {
+  postEvents(taskId: string, events: LoopEvent[]): Promise<void>
+  fetchMessages(taskId: string): Promise<SteeringMessage[]>
+  reportCompletion(taskId: string, result: TaskResult): Promise<void>
+}
+
+createEventReporter(callbackUrl: string): EventReporter
+
+// livectx composition (for custom agents)
+interface LivectxConfig {
+  bindings: LivectxBinding[]
+}
+
+interface LivectxBinding {
+  key: string
+  source: "render" | "github" | "custom"
+  resolver: string
+  staleTime: string
+  placement: "static" | "dynamic"
 }
 ```
 
-### Cloud Context via livectx
+### Execution Model
 
-The worker composes local context (from agent-db via ctx) with cloud context (from external APIs via livectx). livectx bindings handle:
+The agent loop runs in the Render Workflow. The sandbox is a remote execution target.
 
-- **Render service status** — deploy state, health checks (SWR cached, 10s staleTime)
-- **GitHub PR/issue state** — labels, reviews, CI checks (push-invalidated via webhooks)
-- **Fleet awareness** — sibling task statuses for coordination (async from Postgres)
-- **Webhook payloads** — incoming event data that triggered the task
+```
+Render Workflow (the brain):        Sandbox (the hands):
+┌─────────────────────────┐        ┌─────────────────────────┐
+│  agent-db (SQLite)       │        │  /workspace (cloned repo)│
+│  agent-loop              │        │  git, node, python, etc. │
+│  ctx assembly            │  HTTP  │  file system             │
+│  LLM calls (Anthropic)  │◄──────►│  shell execution         │
+│  code_search (local)     │        │  no agent code           │
+│  event reporting         │        │  no LLM keys             │
+└─────────────────────────┘        └─────────────────────────┘
+```
 
-This gives cloud agents situational awareness that local agents don't need.
+### Execution Flow
+
+```
+1. Render Workflow starts, receives RunnerSpec
+2. Provision sandbox via SandboxService (E2B, Fly, etc.)
+3. Clone repo + install deps in sandbox (HTTP exec calls)
+4. createAgentDB locally in workflow process
+5. Index codebase (read files from sandbox over HTTP, embed locally)
+6. createAgentLoop with remote tool registry:
+   - bash, file_read, file_write, git_* → execute in sandbox over HTTP
+   - code_search, compact_conversation → execute locally against agent-db
+   - If livectx configured: compose ctx with live sources
+7. Loop:
+   a. Run agent turn (LLM call in workflow, tool execution in sandbox)
+   b. Post events to callbackUrl
+   c. Poll for steering messages
+   d. If messages: inject as user turns, continue
+   e. If constraints exceeded or agent finished: exit loop
+8. Report completion
+9. Optionally upload agent.db
+10. Destroy sandbox via SandboxService
+```
+
+### Sandbox Providers
+
+| Provider | Implementation | Best For |
+|---|---|---|
+| E2B | `E2BSandboxService` | Production — fast startup, AI-optimized |
+| Fly Machines | `FlySandboxService` | Self-managed, low-latency VMs |
+| Modal | `ModalSandboxService` | GPU workloads, serverless |
+| Docker | `DockerSandboxService` | Local development and testing |
+
+### livectx for Custom Agents
+
+Standard blueprints use the same ctx layer as local — tools for on-demand data. Custom agents that need ambient awareness can opt into livectx:
+
+```typescript
+if (spec.livectx) {
+  const liveSections = spec.livectx.bindings.map(binding =>
+    source({
+      key: [binding.source, binding.key],
+      resolver: resolveBinding(binding),
+      staleTime: binding.staleTime,
+      placement: binding.placement,
+    })
+  );
+  ctx = compose(baseCtx, liveSections);
+}
+```
+
+livectx is a workflow-level concern, not a platform-level one. Most agents never use it.

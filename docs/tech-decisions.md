@@ -101,33 +101,23 @@ Key decisions, their rationale, and alternatives considered.
 
 ---
 
-## Simplified Context Layer (not full livectx)
+## Simplified Context Layer (one layer everywhere)
 
-**Decision:** Build a minimal prompt assembly system (`@gents/agent-ctx`) rather than using livectx for the base layer. Add livectx sources incrementally when the CLI needs live remote data.
+**Decision:** Build a minimal prompt assembly system (`@gents/agent-ctx`) and use it everywhere — local CLI and cloud runners alike.
 
 **Rationale:**
-- The base prompt layer is purpose-built for gents: declarative sections, static/dynamic placement, cache breakpoint — ~200 lines
-- livectx's async/caching machinery is unnecessary for SQLite-backed sections (microsecond reads)
-- But `definePrompt` already supports async resolvers, so livectx sources can be mixed in without rearchitecting
-- When the CLI needs remote data (Render service status, GitHub PR state, deploy health), livectx sources are added to the sections array and gated on credential availability
-- This avoids a hard split where only the cloud worker gets live data — the CLI can be progressively enhanced
+- The prompt layer is purpose-built for gents: declarative sections, static/dynamic placement, cache breakpoint — ~200 lines
+- SQLite-backed sections return in microseconds — no caching, async resolution, or SWR needed
+- Cloud runners use the same ctx layer as local. They don't need "ambient awareness" of infrastructure — they have tools for that.
+- Remote data (Render service status, GitHub PR state) is accessed via tools, not prompt context. The agent decides when to fetch.
+- One context system to understand, test, and maintain
 
-**What the base layer provides:**
+**What the layer provides:**
 - Declarative prompt sections
 - Static/dynamic placement
 - Cache breakpoint for Anthropic prefix caching
 - Clean separation between data resolution and output formatting
-- Async resolver support (ready for livectx sources)
-
-**What livectx adds when used:**
-- SWR cache with staleTime/gcTime for remote API calls
-- Retry and error handling for network requests
-- Push invalidation when webhooks arrive (cloud worker only)
-
-**What we still don't need locally:**
-- Dependency graphs between bindings
-- Multiple sink adapters
-- Template tagged literal DSL
+- Async resolver support (for any future needs)
 
 ---
 
@@ -254,30 +244,24 @@ packages:
 
 ---
 
-## Dual Context Layer: ctx base + livectx sources
+## Tools for Remote Data (not ambient context)
 
-**Decision:** Use `@gents/agent-ctx` as the base prompt layer everywhere. Add `@livectx/core` sources incrementally — in the CLI for optional live data, fully in the cloud worker.
+**Decision:** Remote data (Render API, GitHub API) is accessed via agent tools, not injected into prompt context.
 
 **Rationale:**
-- The base ctx layer handles prompt structure, caching, and SQLite reads — this is always needed
-- livectx sources slot into the same `definePrompt` sections array via async resolvers
-- The CLI can progressively adopt livectx sources gated on credential availability (e.g., Render API token) — no live data if no credentials, graceful degradation
-- The cloud worker uses livectx fully: SWR caching, push invalidation via webhooks, retry
-- One prompt architecture, graduated levels of live data
+- The agent decides when to fetch remote data (on-demand, not every turn)
+- No second data plane needed (no SWR cache, no push invalidation, no subscriptions)
+- Fits the "agent = stateless function over DB" model — tools are the established data access pattern
+- Simpler to implement: one tool definition vs. a caching layer with freshness management
+- Works identically in local CLI and cloud runners
 
 **What uses what:**
 
-| Environment | Context Layer | Live data |
+| Environment | Context Layer | Remote Data |
 |---|---|---|
-| CLI (local, no creds) | `@gents/agent-ctx` | SQLite only — skills, conversation, code index |
-| CLI (local, with creds) | `@gents/agent-ctx` + `@livectx/core` | SQLite + optional Render status, GitHub state |
-| Cloud worker | `@gents/agent-ctx` + `@livectx/core` | SQLite + full infra/GitHub/fleet/CI data |
-| Dashboard | N/A (reads Postgres via API) | No prompt assembly needed |
-
-**Trade-offs accepted:**
-- livectx becomes an optional dependency of the CLI (only loaded when API credentials are configured)
-- Two context "modes" in the CLI (local-only vs. local+live) — but the difference is just whether livectx sections are in the array
-- livectx is a vendored dependency (same as openforge-v2 approach)
+| CLI (local) | `@gents/agent-ctx` | Via tools (render_list_services, etc.) when API key configured |
+| Cloud runner | `@gents/agent-ctx` | Via same tools, always available (keys in runner env) |
+| Dashboard | N/A (reads Postgres) | Direct API calls from Next.js server components |
 
 ---
 
@@ -299,20 +283,32 @@ packages:
 
 ---
 
-## Pluggable Storage Backend (not hardcoded S3)
+## Workflow = Brain, Sandbox = Hands (split execution)
 
-**Decision:** Agent database transfer uses a `StorageProvider` interface with multiple implementations.
+**Decision:** The agent loop (LLM reasoning, agent-db, ctx) runs inside the Render Workflow. The sandbox is a dumb remote execution environment accessed over HTTP for file operations and shell commands.
 
 **Rationale:**
-- Different deployments have different storage needs (AWS, Cloudflare, GCS, local dev)
-- S3-compatible APIs are ubiquitous but not universal
-- R2 has zero egress fees (significant for frequent agent.db transfers)
-- Local filesystem storage is essential for development without cloud dependencies
-- The storage layer is simple (upload, download, list, delete) — abstraction cost is minimal
+- Render Workflows provide durable orchestration — survives transient failures, tracks lifecycle
+- The sandbox doesn't need agent code, LLM keys, or SQLite extensions — just git, runtimes, and an HTTP API
+- Separation of concerns: Workflow = thinking (cheap), Sandbox = doing (isolated, ephemeral)
+- Sandbox provider is pluggable (E2B, Fly Machines, Modal, Docker) via SandboxService abstraction
+- LLM keys stay in the workflow, never exposed to the sandbox environment
+- code_search runs locally in the workflow (fast SQLite queries), only file/exec tools go remote
 
-**Implementations:** S3, R2, GCS, Render persistent disk, local filesystem.
+**What runs where:**
+- **In workflow:** agent-db, agent-loop, ctx assembly, LLM calls, code_search, event reporting
+- **In sandbox (over HTTP):** bash execution, file_read, file_write, file_edit, git operations, dependency installs
 
-**The key insight:** pulling an agent.db from object storage is simpler and more reliable than Postgres-level sync. The database file IS the complete transfer unit. No partial sync, no schema mismatches, no CRDT complexity for phase 2.
+**Service abstractions:**
+- `WorkflowService` — dispatches and tracks Render Workflows
+- `SandboxService` — provisions/destroys isolated execution environments
+- `AuthService` — user auth (NextAuth) and API key management
+
+**Trade-offs accepted:**
+- HTTP latency on every tool call to sandbox (acceptable: 10-50ms per call vs. 10-60s per LLM turn)
+- Can't "resume" a failed task from the exact point of failure (workflow re-launches with same spec)
+- Indexing requires reading files over HTTP from sandbox (one-time cost at task start)
+- Agent db is not the transfer unit between local and cloud (local dispatch sends a spec, not a file)
 
 ---
 
@@ -337,18 +333,40 @@ packages:
 
 **Rationale:**
 - sqlite-sync assigns a 16-byte `site_id` to each database when the extension is first loaded — auto-generated, persistent, unique per DB
-- This is the same identity used for CRDT replication in Phase 3, so adopting it now avoids a future migration
 - No schema changes needed — `cloudsync_siteid()` is a SQL function, not a table column
 - Survives forks correctly — a forked database gets a new site_id (the extension handles this)
 - The extension is loaded with the same non-fatal pattern as sqlite-vector/sqlite-ai — if it's unavailable, gents works fine without identity tracking
-- One identity primitive serves multiple purposes: storage keys, cloud handoff, cross-referencing, and eventually CRDT sync
+- Useful for optional db preservation: when a runner uploads its agent.db for debugging, the site_id provides a unique key
 
 **How it works:**
 - `@sqliteai/sqlite-sync` is an optional dependency of `@gents/agent-db`
-- On database creation, `cloudsync_siteid()` is called and the hex-encoded result is stored on the `AgentDB.siteId` / `WorkspaceDB.siteId` field
-- Storage keys use the site_id: `gents/<org>/<project>/<site_id>/agent.db`
+- On database creation, `cloudsync_siteid()` is called and the hex-encoded result is stored on the `AgentDB.siteId` field
 - Locally, human-friendly filenames (`default.agent.db`, `refactor.agent.db`) remain — the site_id is the canonical identity for machine use
 
 **Trade-offs accepted:**
 - Adds a native extension dependency (same pattern as sqlite-vector, non-fatal if missing)
 - site_id is a hex blob string, not a human-readable UUID (but consistent with how sqlite-sync uses it internally)
+
+---
+
+## Next.js as Unified Cloud Service (not microservices)
+
+**Decision:** The entire cloud platform is a single Next.js app — dashboard, API, webhook handler, and auth in one deploy.
+
+**Rationale:**
+- Small teams won't operate 5 microservices (Gateway, Worker, Dashboard, auth, forge, task, sandbox, deploy)
+- Next.js provides everything needed: React UI (dashboard), API routes (gateway), SSR (auth), and Server-Sent Events (live streaming)
+- One deploy to Render, one service to monitor, one codebase to understand
+- Next.js on Render runs as a persistent Node process, so SSE and long-lived connections work natively
+- NextAuth handles GitHub OAuth with minimal config — no custom auth service needed
+- API routes replace the separate Hono gateway — same functionality, fewer moving parts
+
+**Alternatives considered:**
+- Separate Hono Gateway + Next.js Dashboard + Worker service — more flexible but 3x operational complexity
+- Express/Fastify API + SPA frontend — loses SSR benefits, requires separate deploy
+- Serverless functions (Vercel) — cold starts break SSE, connection limits
+
+**Trade-offs accepted:**
+- Monolithic deploy means scaling the dashboard also scales the API (fine for small teams)
+- Next.js adds framework overhead compared to a bare Hono server (acceptable for the unified benefit)
+- If a team outgrows the single-service model, they can split later (but most never will)

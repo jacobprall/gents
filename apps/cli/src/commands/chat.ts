@@ -167,6 +167,7 @@ interface ModelEntry {
 
 const MODEL_CATALOG: ModelEntry[] = [
   // Anthropic
+  { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: "anthropic" },
   { id: "claude-sonnet-4-20250514", label: "Claude Sonnet 4", provider: "anthropic" },
   { id: "claude-opus-4-20250514", label: "Claude Opus 4", provider: "anthropic" },
   { id: "claude-3-5-sonnet-20241022", label: "Claude 3.5 Sonnet", provider: "anthropic" },
@@ -312,6 +313,7 @@ function handleModelCommand(
 
 export const chatCommand = new Command("chat")
   .description("Start or resume an interactive agent session")
+  .argument("[message]", "Initial message to send (skips first prompt)")
   .option("--repo <path>", "Repository path", process.cwd())
   .option("--session <id>", "Session ID", "default")
   .option("--new", "Force new session")
@@ -320,7 +322,7 @@ export const chatCommand = new Command("chat")
   .option("--no-index", "Skip index freshness check")
   .option("--no-confirm", "Skip tool confirmation prompts")
   .action(
-    async (opts: {
+    async (message: string | undefined, opts: {
       repo: string;
       session: string;
       new?: boolean;
@@ -501,6 +503,21 @@ export const chatCommand = new Command("chat")
         });
 
         let busy = false;
+
+        if (message) {
+          busy = true;
+          printTurnSeparator();
+          process.stdout.write("\n");
+          try {
+            for await (const event of loop.run(db, message)) {
+              handleLoopEvent(event);
+            }
+          } catch (e) {
+            spinner.stop();
+            printError(e instanceof Error ? e.message : String(e));
+          }
+          busy = false;
+        }
 
         const promptUser = (): void => {
           rl.question(`\n  ${accent("❯")} `, (input: string) => {

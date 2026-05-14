@@ -1,6 +1,6 @@
 # gents — Context Layer (ctx)
 
-A minimal prompt assembly layer. No SWR cache, no dependency graphs, no subscriptions. Just declarative prompt composition with LLM prefix caching.
+A minimal prompt assembly layer used everywhere — local CLI and cloud runners alike. No SWR cache, no dependency graphs, no subscriptions. Just declarative prompt composition with LLM prefix caching.
 
 ---
 
@@ -171,17 +171,17 @@ Different providers have different caching mechanisms (or none). The breakpoint 
 
 ---
 
-## Differences from livectx
+## Why Not a More Complex Context Layer?
 
-| livectx | gents/ctx |
+Problems that don't exist with this architecture:
+
+| Problem | Why It Doesn't Apply |
 |---|---|
-| SWR cache with staleTime/gcTime | No cache (SQLite reads are fast enough) |
-| Async resolvers with retry | Sync resolvers (local DB reads) |
-| Dependency graphs between bindings | No dependencies (sections are independent) |
-| Push invalidation / subscriptions | No subscriptions (re-resolve each turn) |
-| Multiple sink adapters | Anthropic only (add others as needed) |
-| Budget accounting at context layer | Handled by hooks in the agent loop |
-| Template tagged literal DSL | Plain function calls |
-| General-purpose library | Purpose-built for gents agent |
+| Network fetching for context | Data lives in SQLite (microsecond reads) |
+| Caching remote data | Remote data accessed via tools, not context |
+| Stale response handling | No cached remote data to go stale |
+| Async resolution ordering | Resolvers are synchronous |
+| Push invalidation | No subscriptions to invalidate |
+| Multiple output formats | Anthropic only (add others as needed) |
 
-The simplification is intentional. livectx solves problems that don't exist when your data is in a local database: network fetching, caching remote data, handling stale responses, async resolution ordering. With SQLite, resolvers are synchronous microsecond reads. The complexity budget goes elsewhere.
+The ctx layer is used identically in local CLI and cloud runners. Cloud runners don't need "ambient awareness" — they access remote data (Render API, GitHub API) via tools when the agent decides to fetch it. This keeps one simple context system everywhere.

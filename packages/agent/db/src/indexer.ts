@@ -108,7 +108,7 @@ function listSourceFiles(
         continue;
       }
       if (e.isDirectory()) {
-        if (e.name === ".git") continue;
+        if (e.name === ".git" || e.name === ".gents") continue;
         if (exclude.some((p) => globMatch(p, entryRel) || globMatch(p, `${entryRel}/`))) continue;
         if (gitIgnored(entryRel, true, localRules)) continue;
         walk(full, localRules);

@@ -192,32 +192,79 @@ Options:
 - `chunk_size` — Chunk size for indexing (default: 1000)
 - `chunk_overlap` — Chunk overlap (default: 150)
 
-### gents handoff (Phase 2)
+### gents dispatch (Phase 2)
 
-Upload current session to cloud for long-running execution.
+Create a cloud task. The Next.js app launches a runner to execute it.
 
 ```
-gents handoff [options]
+gents dispatch <instructions> [options]
 
 Options:
-  --task <instructions>  Instructions for the cloud agent
-  --session <id>         Session to hand off (default: current)
+  --repo <url>           Repository URL (default: current repo's remote)
+  --ref <branch|sha>     Branch or commit (default: current branch)
+  --blueprint <name>     Agent blueprint to use (default: "default")
+  --max-turns <n>        Maximum agent turns (default: 25)
+  --max-cost <usd>       Cost limit in USD (default: 10.00)
+  --timeout <minutes>    Timeout in minutes (default: 120)
+  --attach               Immediately attach after dispatch
+```
+
+**Example:**
+```
+$ gents dispatch "Fix the failing auth tests and open a PR" --attach
+
+  Task created: a3f2b1c
+  Runner starting...
+
+  Agent: I'll look at the failing tests.
+    ├ bash: npm test -- auth.test.ts
+    ...
 ```
 
 ### gents attach (Phase 2)
 
-Connect to a running cloud task and stream events.
+Connect to a running cloud task. Stream events and send steering messages.
 
 ```
 gents attach <task-id> [options]
 
 Options:
-  --interactive        Allow sending messages to the agent
+  --no-interactive     Watch only (don't allow sending messages)
+```
+
+**Behavior:**
+1. Connects to SSE endpoint: `GET /api/tasks/<id>/events`
+2. Streams conversation and tool calls to terminal in real-time
+3. User can type messages (sent via POST /api/tasks/<id>/messages)
+4. Agent picks up messages on its next turn
+5. Ctrl+D or `/exit` detaches without cancelling the task
+
+### gents tasks (Phase 2)
+
+List and manage cloud tasks.
+
+```
+gents tasks [options]
+
+Options:
+  --status <status>    Filter by status (pending, running, completed, failed)
+  --repo <url>         Filter by repository
+  --limit <n>          Max results (default: 20)
+  --json               Output as JSON
+```
+
+**Example:**
+```
+$ gents tasks --status running
+
+  ID       Status    Blueprint        Repo                  Age
+  a3f2b1c  running   default          org/api-server        12m
+  b7d4e2a  running   security-review  org/web-app           3m
 ```
 
 ### gents fork
 
-Fork an agent session.
+Fork a local agent session.
 
 ```
 gents fork [options]
@@ -331,3 +378,5 @@ Agent responses stream token-by-token. Tool calls are shown with:
 | `GENTS_CONFIG_DIR` | Override config directory (~/.gents) | No |
 | `GENTS_NO_COLOR` | Disable color output | No |
 | `GENTS_LOG_LEVEL` | Logging level (debug, info, warn, error) | No |
+| `GENTS_API_URL` | URL of the gents Next.js app (for dispatch/attach) | No |
+| `GENTS_API_KEY` | API key for cloud access | No |

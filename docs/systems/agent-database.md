@@ -195,7 +195,7 @@ CREATE TABLE metrics (
 );
 ```
 
-This table is the local equivalent of openforge-v2's `task_metrics_hourly`. Locally it stores per-turn granularity. When forwarded to the cloud, the Gateway aggregates these into hourly buckets in Postgres for fleet-wide dashboards.
+Per-turn cost and usage data. In cloud runners, this data is reported to the Next.js app via event callbacks (the runner POSTs turn metrics after each turn, and the app updates the `tasks` row with running totals).
 
 ### tools
 

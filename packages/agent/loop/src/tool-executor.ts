@@ -107,7 +107,7 @@ export async function* executeToolsParallel(
       continue;
     }
 
-    const { toolCall, output, durationMs } = result.value;
+    const { output, durationMs } = result.value;
     let finalOutput = truncateOutput(output, cfg.maxToolOutputBytes);
 
     const postToolResult = await cfg.hooks.runPostTool(hookCtx, toolCall.name, finalOutput);

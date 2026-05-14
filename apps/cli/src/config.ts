@@ -82,7 +82,7 @@ export function resolveConfig(flags: Partial<ResolvedConfig>): ResolvedConfig {
     flags.model ??
     process.env.GENTS_MODEL ??
     readGlobalConfig("model") ??
-    "claude-sonnet-4-20250514";
+    "claude-sonnet-4-6";
 
   const VALID_PROVIDERS: ProviderName[] = ["anthropic", "openai", "google"];
   const rawProvider = flags.provider ?? readGlobalConfig("provider");

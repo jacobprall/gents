@@ -6,14 +6,13 @@ A cloud agent with live infrastructure awareness that can monitor health, manage
 
 ## Trigger
 
-Multiple trigger modes — this agent is more versatile than event-driven review:
+Multiple trigger modes:
 
 | Trigger | Use Case |
 |---|---|
 | GitHub PR webhook | Spin up preview environment for the PR |
-| Manual (CLI/dashboard) | "Scale up the API service" / "Debug why staging is slow" |
-| Scheduled (cron-style) | Periodic health check and remediation |
-| Alert webhook (future) | Render/external monitoring fires alert → agent investigates |
+| Manual (CLI dispatch / dashboard) | "Scale up the API service" / "Debug why staging is slow" |
+| Scheduled (cron-style, future) | Periodic health check and remediation |
 
 ---
 
@@ -74,48 +73,41 @@ Principles:
 
 ---
 
-## Context (livectx-powered)
+## Context
 
-This is where the agent diverges from simpler task agents. It needs **live data from external services**, which is exactly what livectx is designed for in the cloud worker.
+This is a **Tier 3 custom agent** — it opts into livectx bindings for ambient infrastructure awareness. Unlike standard agents that fetch remote data on-demand via tools, this agent gets live service health and deploy status injected into its context every turn.
 
 ```typescript
-import { source } from "@livectx/core";
-
-// Live service health — refreshes every 10s, push-invalidated on deploy events
-const serviceHealth = source({
-  key: ["render", "services", projectId],
-  resolver: () => render.listServices(projectId),
-  staleTime: "10s",
-  placement: "dynamic",
-});
-
-// Current deploy status — refreshes every 30s
-const deployStatus = source({
-  key: ["render", "deploy", serviceId],
-  resolver: () => render.getLatestDeploy(serviceId),
-  staleTime: "30s",
-  placement: "dynamic",
-});
-
-// Preview environments — refreshes every 60s
-const previews = source({
-  key: ["render", "previews", projectId],
-  resolver: () => render.listPreviews(projectId),
-  staleTime: "60s",
-  placement: "dynamic",
-});
-
-// PR state (if triggered by PR webhook)
-const prState = source({
-  key: ["github", "pr", prNumber],
-  resolver: () => github.pulls.get({ pull_number: prNumber }),
-  staleTime: "30s",
-  subscribe: true, // push-invalidated via webhook
-  placement: "dynamic",
-});
+const infraManagerLivectx: LivectxConfig = {
+  bindings: [
+    {
+      key: "service-health",
+      source: "render",
+      resolver: "render.listServices",
+      staleTime: "10s",
+      placement: "dynamic",
+    },
+    {
+      key: "deploy-status",
+      source: "render",
+      resolver: "render.getLatestDeploy",
+      staleTime: "30s",
+      placement: "dynamic",
+    },
+    {
+      key: "pr-state",
+      source: "github",
+      resolver: "github.pulls.get",
+      staleTime: "30s",
+      placement: "dynamic",
+    },
+  ],
+};
 ```
 
-The static prefix (system prompt, project config) is cached via Anthropic `cache_control`. Dynamic sections pull live state from livectx on every turn — the agent always sees current infra status.
+Static sections (system prompt, project config) are cached via Anthropic `cache_control`. Dynamic livectx sections refresh on their staleTime schedule — the agent always sees current infra status without explicit tool calls.
+
+The agent also has Render tools available for mutating operations (scale, restart, create preview) — livectx provides read awareness, tools provide write actions.
 
 ---
 
@@ -147,17 +139,11 @@ Cloud workers connect to these over HTTP (local stdio not available in cloud VMs
 
 ## Execution Model
 
-### Open question: discrete tasks vs always-on daemon
+Discrete tasks via runners. Each trigger creates a new task, a runner spins up a sandbox, executes, and exits.
 
-The current gents architecture models work as **discrete tasks** (created → runs → completes, 2-hour default timeout). This agent concept pushes against that:
-
-| Model | How It Works | Pros | Cons |
-|---|---|---|---|
-| **Discrete per-event** | Each webhook/trigger creates a new task. Agent runs, does its thing, exits. | Fits current design. Simple. No resource leak. | No persistent awareness. Each task starts cold. |
-| **Recurring scheduled** | A cron dispatches a new task every N minutes. Agent checks health, acts if needed, exits. | Still discrete. Periodic awareness. | Gaps between checks. Cold start overhead. |
-| **Long-lived daemon** | A single task that runs continuously, reacting to events pushed to it via steering. | Persistent awareness. Immediate reaction. | Not in current design. Resource cost. Needs "always-on task" concept. |
-
-**Recommendation for Phase 2:** Start with **discrete per-event** for webhook-triggered work (PR → preview) and **recurring scheduled** for health monitoring. Defer the daemon model until there's a proven need that discrete tasks can't serve.
+- **Webhook-triggered** (PR opened → preview): runner receives the spec, creates preview, posts URL, exits
+- **Manually dispatched** ("debug why staging is slow"): runner investigates via tools, reports findings, exits
+- **Scheduled** (future, daily health check): recurring dispatch creates fresh tasks on a cron
 
 ---
 
@@ -166,8 +152,8 @@ The current gents architecture models work as **discrete tasks** (created → ru
 ### PR Preview Environment
 
 ```
-1. GitHub PR opened → forge creates task (blueprint: infrastructure-manager)
-2. Agent reads PR metadata via livectx
+1. GitHub PR opened → routing rule matches → runner dispatched (blueprint: infrastructure-manager)
+2. Agent reads PR metadata via github tools
 3. Agent calls render_create_preview for the PR branch
 4. Agent waits for deploy to succeed (polls via render_get_deploy_status)
 5. Agent posts preview URL as PR comment via github_add_pr_comment
@@ -180,7 +166,7 @@ The current gents architecture models work as **discrete tasks** (created → ru
 
 ```
 1. Cron triggers task creation (blueprint: infrastructure-manager)
-2. Agent reads live service health via livectx
+2. Agent checks live service health via render tools
 3. All healthy → completes silently
 4. Service unhealthy → agent investigates:
    a. Check logs via render_get_logs
@@ -198,10 +184,8 @@ The current gents architecture models work as **discrete tasks** (created → ru
 | Dependency | Phase | Status |
 |---|---|---|
 | AgentBlueprint system | Phase 1 | **Built** |
-| forge service (webhook → task) | Phase 2, M10 | Not built |
-| Gateway + Worker | Phase 2, M8-M9 | Not built |
-| livectx integration in worker | Phase 2 | Not built |
-| Render MCP server | Phase 2 | Not built |
-| GitHub MCP server | Phase 2 | Not built |
-| Scheduled task dispatch (cron) | Phase 2+ | Not designed |
-| Always-on daemon model | Phase 3? | Not designed |
+| Next.js app (webhook handler + task dispatch) | Phase 2, M8 | Not built |
+| Runner package (`@gents/runner`) | Phase 2, M7 | Not built |
+| Render API tools | Phase 2 | Not built |
+| GitHub API tools | Phase 2 | Not built |
+| Scheduled task dispatch (cron) | Phase 3 | Not designed |

@@ -1,6 +1,6 @@
 # gents — Cloud Platform (Phase 2)
 
-The cloud platform turns gents from a local coding agent into a fleet of autonomous software engineers that react to events, run long-lived tasks, and report through a dashboard.
+The cloud platform turns gents from a local coding agent into a team tool: agents run as workflows on Render, triggered by webhooks or dispatched from CLI/dashboard, with live conversation tracking and steering.
 
 ---
 
@@ -13,462 +13,694 @@ The local agent is excellent for interactive work: you chat, it codes, you itera
 - **Parallel tasks** — Five PRs need review. Five agents run simultaneously.
 - **Team visibility** — Your teammate wants to see what the agent is doing on their PR.
 
-The cloud platform handles these. The same agent loop, the same database, the same tools — just running on Render instead of your laptop.
+---
+
+## Architecture
+
+One deploy. One database. Service abstractions for execution.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│          gents (Next.js on Render)                             │
+│                                                               │
+│  ┌─────────────────┐  ┌───────────────────────────────────┐  │
+│  │  Dashboard       │  │  API Routes                       │  │
+│  │  (React/SSR)     │  │                                   │  │
+│  │                  │  │  POST /api/webhooks/github         │  │
+│  │  - Task list     │  │  POST /api/tasks                  │  │
+│  │  - Live convo    │  │  GET  /api/tasks/:id/events (SSE) │  │
+│  │  - Config        │  │  POST /api/tasks/:id/messages     │  │
+│  │  - Routing rules │  │  POST /api/tasks/:id/cancel       │  │
+│  └─────────────────┘  └───────────────────────────────────┘  │
+│                                                               │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  Service Layer                                           │  │
+│  │  WorkflowService · SandboxService · AuthService          │  │
+│  └─────────────────────────────────────────────────────────┘  │
+│                                                               │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  Postgres (Render Managed)                               │  │
+│  │  tasks · task_logs · task_messages · routing_rules        │  │
+│  └─────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────┬────────────────────────────┘
+                                   │
+                        WorkflowService.dispatch()
+                                   │
+┌──────────────────────────────────┼────────────────────────────┐
+│          Render Workflow (the brain)                            │
+│                                                                │
+│  ┌─────────────────────────────────────────────────────────┐  │
+│  │  Agent Loop + agent-db + ctx + LLM calls                 │  │
+│  │                                                          │  │
+│  │  1. Provision sandbox (via SandboxService)               │  │
+│  │  2. Clone repo + install deps (commands over HTTP)       │  │
+│  │  3. Run agent loop:                                      │  │
+│  │     LLM decides → tool calls execute in sandbox via HTTP │  │
+│  │  4. Report events back to Next.js app                    │  │
+│  │  5. Tear down sandbox on completion                      │  │
+│  └────────────────────────────────┬────────────────────────┘  │
+│                                   │                            │
+│                          HTTP (exec, file ops)                 │
+│                                   │                            │
+│  ┌───────────┐  ┌───────────┐  ┌─┴─────────┐                 │
+│  │ Sandbox A  │  │ Sandbox B  │  │ Sandbox C  │                 │
+│  │ (E2B/etc)  │  │ (E2B/etc)  │  │ (E2B/etc)  │                 │
+│  │ file ops   │  │ file ops   │  │ file ops   │                 │
+│  │ exec cmds  │  │ exec cmds  │  │ exec cmds  │                 │
+│  └───────────┘  └───────────┘  └───────────┘                 │
+└───────────────────────────────────────────────────────────────┘
+```
+
+**Key insight:** The agent loop runs in the workflow (cheap compute, has LLM keys, holds the agent-db). The sandbox is a dumb execution environment — it only runs shell commands and file operations, accessed over HTTP. The sandbox doesn't need agent packages, LLM keys, or sqlite extensions.
 
 ---
 
-## livectx in the Cloud
+## Service Abstractions
 
-The local agent uses a simplified context layer (`ctx`) because all data is in a local SQLite database — synchronous reads, no caching needed. The cloud worker has a fundamentally different context problem: it needs live data from external services.
+The platform uses interface-based abstractions for external services. This keeps the core decoupled from any single provider.
 
-### Why livectx Matters Here
+### WorkflowService
 
-Cloud agents need context that doesn't live in their database:
-
-| Context Source | Nature | livectx Feature Used |
-|---|---|---|
-| Render service status | Live, changes during task | SWR cache with short staleTime |
-| GitHub PR state | Updated by external actors | Push invalidation via webhook |
-| CI/CD pipeline results | Async, arrives mid-task | Subscription + cache invalidation |
-| Deploy preview URLs | Created during task | Dependency graph (deploy depends on build) |
-| Other agent task status | Fleet coordination | Async resolution, periodic refresh |
-| Review comments | Arrive during long tasks | Push invalidation via webhook |
-
-livectx's async resolution, SWR caching, dependency graphs, and push invalidation are designed for exactly this: assembling context from multiple remote sources with different freshness requirements.
-
-### Composition: ctx + livectx
-
-The cloud worker composes both layers into a single prompt:
+Orchestrates task lifecycle — durable execution that survives transient failures.
 
 ```typescript
-import { definePrompt } from "@gents/agent-ctx";
-import { source, prompt as livePrompt, cacheBreakpoint } from "@livectx/core";
+interface WorkflowService {
+  dispatch(spec: RunnerSpec): Promise<{ workflowId: string }>;
+  getStatus(workflowId: string): Promise<WorkflowStatus>;
+  cancel(workflowId: string): Promise<void>;
+}
 
-// Local bindings (fast, from SQLite)
-const localSections = [
-  { name: "system", placement: "static", resolve: (db) => systemPrompt },
-  { name: "project", placement: "static", resolve: (db) => getProjectOverview(db) },
-  { name: "conversation", placement: "dynamic", resolve: (db) => getConversation(db) },
-];
+// Primary implementation
+class RenderWorkflowService implements WorkflowService {
+  // Uses Render Workflows API to dispatch durable workflow runs
+}
+```
 
-// Remote bindings (async, cached via livectx)
-const prState = source({
-  key: ["github", "pr", prNumber],
-  resolver: () => github.pulls.get({ pull_number: prNumber }),
-  staleTime: "30s",
-  placement: "dynamic",
-});
+### SandboxService
 
-const deployStatus = source({
-  key: ["render", "deploy", serviceId],
-  resolver: () => render.getServiceStatus(serviceId),
-  staleTime: "10s",
-  placement: "dynamic",
-});
+Provisions isolated execution environments accessed over HTTP. The sandbox is a dumb container — it exposes file operations and command execution. All reasoning happens in the workflow.
 
-const ciResults = source({
-  key: ["github", "checks", headSha],
-  resolver: () => github.checks.listForRef({ ref: headSha }),
-  staleTime: "1m",
-  subscribe: true,  // invalidate on webhook push
-  placement: "dynamic",
+```typescript
+interface SandboxService {
+  create(config: SandboxConfig): Promise<Sandbox>;
+  destroy(sandboxId: string): Promise<void>;
+}
+
+interface SandboxConfig {
+  image?: string;           // base image (git, build tools, runtimes)
+  timeout: number;          // max lifetime in minutes
+  resources?: {
+    cpu?: string;           // e.g. "2"
+    memory?: string;        // e.g. "4Gi"
+  };
+  env?: Record<string, string>;
+}
+
+interface Sandbox {
+  id: string;
+  status: "creating" | "ready" | "running" | "stopped";
+  url: string;              // HTTP endpoint for exec/file operations
+  
+  // Operations (called over HTTP from the workflow)
+  exec(command: string, opts?: { cwd?: string; timeout?: number }): Promise<ExecResult>;
+  readFile(path: string): Promise<string>;
+  writeFile(path: string, content: string): Promise<void>;
+  listDir(path: string): Promise<DirEntry[]>;
+  uploadFiles(files: FileUpload[]): Promise<void>;
+  downloadFiles(paths: string[]): Promise<FileDownload[]>;
+}
+
+interface ExecResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+```
+
+The sandbox doesn't need:
+- Agent packages (`@gents/*`)
+- LLM API keys
+- SQLite extensions
+- Nomic Embed model
+
+It only needs: git, language runtimes, build tools, and an HTTP API for remote execution.
+
+**Implementations (pluggable):**
+
+| Provider | Notes |
+|---|---|
+| E2B | Cloud sandboxes optimized for AI agents. Fast startup, good SDK. |
+| Fly Machines | Low-latency ephemeral VMs. Self-managed but flexible. |
+| Modal | Serverless containers with GPU support. |
+| Docker (local) | For development and testing. |
+
+### AuthService
+
+Handles user authentication and authorization.
+
+```typescript
+interface AuthService {
+  verifyToken(token: string): Promise<User | null>;
+  createApiKey(userId: string, name: string): Promise<ApiKey>;
+  revokeApiKey(keyId: string): Promise<void>;
+  listApiKeys(userId: string): Promise<ApiKey[]>;
+}
+
+// Primary implementation: NextAuth + Postgres-backed API keys
+class NextAuthService implements AuthService { }
+```
+
+---
+
+## Next.js App
+
+The single cloud service. Handles everything user-facing.
+
+### API Routes
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/api/webhooks/github` | POST | Receive GitHub webhooks, match routing rules, create tasks |
+| `/api/tasks` | GET | List tasks (with filters: status, repo, blueprint) |
+| `/api/tasks` | POST | Create a new task (from CLI dispatch or dashboard) |
+| `/api/tasks/:id` | GET | Task detail (status, result, cost) |
+| `/api/tasks/:id/events` | GET | SSE stream of task events (live conversation) |
+| `/api/tasks/:id/messages` | POST | Send steering message to running task |
+| `/api/tasks/:id/cancel` | POST | Cancel a running task |
+| `/api/tasks/:id/logs` | GET | Paginated task logs |
+| `/api/health` | GET | Health check |
+
+### Auth
+
+NextAuth with GitHub provider via the AuthService abstraction:
+- Team members sign in via GitHub OAuth
+- API keys for CLI access (`gents config set api_key <key>`)
+- No complex RBAC — if you have access to the app, you can view and dispatch tasks
+
+### Dashboard Pages
+
+- **Task list** — all active/completed/failed tasks with status, cost, duration
+- **Task detail** — live conversation view, tool call log, steering input
+- **Routing rules** — configure which GitHub events trigger which blueprints
+- **Settings** — API keys, default blueprints, cost limits, sandbox provider config
+
+### Webhook Handler
+
+```typescript
+app.post("/api/webhooks/github", async (req) => {
+  const event = parseGitHubWebhook(req);
+  const rules = await db.query("SELECT * FROM routing_rules WHERE enabled = true");
+  
+  for (const rule of rules) {
+    if (matchesRule(event, rule)) {
+      const task = await createTask({
+        repo: event.repository.clone_url,
+        ref: event.ref || event.pull_request?.head.ref,
+        blueprint: rule.blueprint,
+        instructions: resolveInstructions(rule.instructions, event),
+        origin: "webhook",
+      });
+      
+      // Dispatch via WorkflowService
+      await workflowService.dispatch(task.toRunnerSpec());
+    }
+  }
 });
 ```
 
-The static prefix (system prompt, project overview) uses Anthropic cache_control. Dynamic sections mix local SQLite reads and livectx-resolved remote data. livectx handles the complexity of stale data, retries, and push invalidation so the agent loop doesn't have to.
+---
+
+## Workflow Execution
+
+The Render Workflow is the brain — it runs the agent loop, holds the agent-db, calls the LLM, and makes all decisions. The sandbox is just the hands — a remote environment where file operations and shell commands execute over HTTP.
+
+### What Runs Where
+
+| Component | Runs In | Why |
+|---|---|---|
+| Agent loop | Workflow | Cheap compute, orchestration logic |
+| agent-db (SQLite) | Workflow | Local to the reasoning process |
+| LLM calls (Anthropic) | Workflow | Keys stay in workflow, not sandbox |
+| ctx assembly | Workflow | Reads from local agent-db |
+| code_search | Workflow | Queries local SQLite vectors |
+| bash, file_read, file_write, git_* | **Sandbox** (over HTTP) | Needs the repo filesystem |
+| Dependency install, test runs | **Sandbox** (over HTTP) | Needs the full dev environment |
+
+### RunnerSpec
+
+What the Next.js app provides when dispatching a workflow:
+
+```typescript
+interface RunnerSpec {
+  taskId: string;
+  repo: string;
+  ref: string;
+  blueprint: string;
+  instructions: string;
+  callbackUrl: string;        // POST events back here
+  constraints: {
+    maxTurns: number;
+    maxCostUsd: number;
+    timeoutMinutes: number;
+  };
+  secrets: {
+    anthropicKey: string;
+    githubToken: string;
+  };
+  sandbox?: {
+    provider?: string;        // override default sandbox provider
+    image?: string;           // custom base image
+    resources?: { cpu?: string; memory?: string };
+  };
+  preserveDb?: boolean;       // upload agent.db on completion
+  livectx?: LivectxConfig;    // opt-in live context for custom agents
+}
+```
+
+### Workflow Lifecycle
+
+```typescript
+async function executeWorkflow(spec: RunnerSpec) {
+  // 1. Provision sandbox (remote execution environment)
+  const sandbox = await sandboxService.create({
+    timeout: spec.constraints.timeoutMinutes,
+    resources: spec.sandbox?.resources,
+    env: { GITHUB_TOKEN: spec.secrets.githubToken },
+  });
+  
+  try {
+    // 2. Set up environment in sandbox (commands over HTTP)
+    await sandbox.exec(`git clone --depth=1 --branch=${spec.ref} ${authUrl(spec)} /workspace`);
+    await sandbox.exec(detectAndInstallDeps("/workspace"));
+    
+    // 3. Run agent loop IN THE WORKFLOW (not in sandbox)
+    await runAgentLoop(sandbox, spec);
+    
+  } finally {
+    // 4. Tear down sandbox
+    await sandboxService.destroy(sandbox.id);
+  }
+}
+
+async function runAgentLoop(sandbox: Sandbox, spec: RunnerSpec) {
+  // Agent-db lives in the workflow process
+  const db = createAgentDB("/tmp/agent.db");
+  
+  // Index codebase by reading files from sandbox
+  const files = await sandbox.listDir("/workspace", { recursive: true });
+  await indexFromRemoteFiles(db, sandbox, files);
+  
+  appendMessage(db, { role: "user", content: spec.instructions });
+  
+  // Tools execute against the sandbox over HTTP
+  const tools = createRemoteToolRegistry(sandbox);
+  
+  const loop = createAgentLoop({
+    model: spec.blueprint.model,
+    apiKey: spec.secrets.anthropicKey,
+    tools,
+    ctx: spec.livectx ? composeWithLivectx(baseCtx, spec.livectx) : baseCtx,
+  });
+  
+  let done = false;
+  while (!done) {
+    const events = [];
+    for await (const event of loop.step(db)) {
+      events.push(event);
+      if (event.type === "turn.complete") done = shouldStop(event, spec.constraints);
+    }
+    
+    // Report events back to Next.js app
+    await postEvents(spec.callbackUrl, spec.taskId, events);
+    
+    // Check for steering messages
+    const messages = await fetchMessages(spec.callbackUrl, spec.taskId);
+    if (messages.length > 0) {
+      for (const msg of messages) {
+        appendMessage(db, { role: "user", content: msg.content });
+      }
+      done = false;
+    }
+  }
+  
+  await reportCompletion(spec.callbackUrl, spec.taskId, db);
+  if (spec.preserveDb) await uploadDb(db, spec.taskId);
+}
+```
+
+### Remote Tool Registry
+
+The key difference from local: tools that need the filesystem execute over HTTP against the sandbox.
+
+```typescript
+function createRemoteToolRegistry(sandbox: Sandbox): ToolRegistry {
+  const registry = createToolRegistry();
+  
+  // These execute REMOTELY in the sandbox
+  registry.register({
+    name: "bash",
+    execute: async (input) => {
+      const result = await sandbox.exec(input.command, { cwd: input.cwd });
+      return `exit ${result.exitCode}\n${result.stdout}\n${result.stderr}`;
+    },
+  });
+  
+  registry.register({
+    name: "file_read",
+    execute: async (input) => await sandbox.readFile(input.path),
+  });
+  
+  registry.register({
+    name: "file_write",
+    execute: async (input) => {
+      await sandbox.writeFile(input.path, input.content);
+      return "File written.";
+    },
+  });
+  
+  registry.register({
+    name: "file_edit",
+    execute: async (input) => {
+      const content = await sandbox.readFile(input.path);
+      const updated = content.replace(input.oldString, input.newString);
+      await sandbox.writeFile(input.path, updated);
+      return "File edited.";
+    },
+  });
+  
+  // These execute LOCALLY in the workflow (against agent-db)
+  registry.register({
+    name: "code_search",
+    execute: async (input, ctx) => hybridSearch(ctx.db, input.query),
+  });
+  
+  registry.register({
+    name: "compact_conversation",
+    execute: async (input, ctx) => compactConversation(ctx.db, input.upToTurn, input.summary),
+  });
+  
+  return registry;
+}
+```
+
+### Workflow Tiers
+
+| Tier | Description | LLM? | Use Cases |
+|---|---|---|---|
+| **Tier 1: Script** | Run predefined commands in sandbox, report results | No | Run tests, lint, type-check, deploy preview |
+| **Tier 2: Agent** | Full agent loop in workflow, sandbox for execution | Yes | Code review, PR fixes, migrations, security scan |
+| **Tier 3: Custom Agent** | Agent loop + livectx bindings for live awareness | Yes | Infra management, monitoring, deployment automation |
+
+Tier 1 workflows are effectively GitHub Actions on Render — zero LLM cost, just sandbox commands. Tier 2 workflows run the full agent loop. Tier 3 workflows opt into livectx for ambient awareness of live systems.
 
 ---
 
-## Components
+## livectx for Custom Agents
 
-### Gateway (Hono on Bun)
+Standard agents (Tier 2) use the same `ctx` layer as local — tools for on-demand remote data. But specialized agents that need **ambient awareness** of live systems can opt into livectx bindings.
 
-The API server. Handles:
-- REST endpoints for task CRUD, event queries, session management
-- SSE for live event streaming to dashboard
-- GitHub OAuth for user authentication
-- GitHub webhook ingestion and routing
-- Task dispatch to Render Workflows
-- Health checks and monitoring
+### When to Use livectx
 
-Port 4100. Stateless (reads from Postgres). Horizontally scalable.
+| Scenario | Use livectx? | Why |
+|---|---|---|
+| Security review (read diff, report) | No | One-shot, no ongoing awareness needed |
+| Fix failing tests | No | Reads error, fixes, done |
+| Infrastructure monitor | **Yes** | Needs current service health every turn |
+| Deployment automation | **Yes** | Needs deploy status, health checks, rollback readiness |
+| Long-running migration with CI awareness | **Yes** | Needs to see CI results as they arrive |
 
-### Worker (Render Workflows)
+### How It Works
 
-The execution engine. Each task gets a durable workflow run:
-- Persistent disk with the agent's `.agent.db` file
-- Timeout: 2 hours default, configurable per task
-- Automatic retry on crash (reopen database, continue from last event)
-- Isolated execution environment (agent can't affect other tasks)
+When a blueprint specifies livectx bindings, the runner composes them into the ctx layer:
 
-The worker:
-1. Downloads/creates the `.agent.db` on persistent disk
-2. Runs the agent loop against it
-3. Forwards events to Postgres for dashboard visibility
-4. Accepts steering commands (pause, cancel, redirect) via the database
-5. On completion: marks task done, persists final database state
+```typescript
+interface LivectxConfig {
+  bindings: LivectxBinding[];
+}
 
-### Dashboard (Next.js)
+interface LivectxBinding {
+  key: string;
+  source: "render" | "github" | "custom";
+  resolver: string;           // function name or endpoint
+  staleTime: string;          // e.g. "10s", "30s", "1m"
+  placement: "static" | "dynamic";
+}
 
-Fleet-wide visibility:
-- **Task list** — all active/completed/failed tasks with status
-- **Task detail** — live event stream, conversation view, tool execution log
-- **Fleet view** — resource usage, cost tracking, agent health
-- **Steering** — send messages to running agents, pause/cancel tasks
-- **Settings** — user config, API keys, project defaults
+// Example: infrastructure manager blueprint
+const infraManagerLivectx: LivectxConfig = {
+  bindings: [
+    {
+      key: "service-health",
+      source: "render",
+      resolver: "render.listServices",
+      staleTime: "10s",
+      placement: "dynamic",
+    },
+    {
+      key: "deploy-status",
+      source: "render",
+      resolver: "render.getLatestDeploy",
+      staleTime: "30s",
+      placement: "dynamic",
+    },
+  ],
+};
+```
 
-### Postgres (Render Managed)
+The runner detects `spec.livectx` and composes the standard ctx sections with livectx sources:
 
-Fleet-wide aggregate state:
-- `users` — authentication, preferences
-- `tasks` — metadata, status, cost, assignment
-- `task_events` — events forwarded from agent databases
-- `api_keys` — programmatic access
-- `sessions` — auth sessions
+```typescript
+import { source, compose } from "@livectx/core";
 
-Postgres is NOT the agent's primary store. It's the dashboard's read model. The agent writes to its SQLite database; events are forwarded to Postgres asynchronously.
+function composeWithLivectx(baseCtx: Prompt, config: LivectxConfig): Prompt {
+  const liveSections = config.bindings.map(binding => source({
+    key: [binding.source, binding.key],
+    resolver: resolveBinding(binding),
+    staleTime: binding.staleTime,
+    placement: binding.placement,
+  }));
+  
+  return compose(baseCtx, liveSections);
+}
+```
+
+This means:
+- Standard blueprints (security-reviewer, pr-fixer) work without livectx — no complexity tax
+- Custom blueprints (infra-manager, deploy-automation) opt in and get live data injected every turn
+- livectx is a dependency of `@gents/runner`, not of the core agent packages
+
+---
+
+## Conversation Tracking and Steering
+
+The core differentiator: running agents have live conversations that anyone on the team can watch and participate in.
+
+### How It Works
+
+1. Runner completes a turn → POSTs events (assistant message, tool calls, results) to Next.js app
+2. Next.js app inserts into `task_logs` and broadcasts via SSE
+3. Connected clients (CLI via `gents attach`, web dashboard) receive events in real-time
+4. User types a message → POST to `/api/tasks/:id/messages` → stored in `task_messages`
+5. Runner polls `/api/tasks/:id/messages?since=<last>` between turns
+6. If pending messages exist, runner injects them as user turns and continues
+
+### Multiple Users
+
+Multiple team members can watch and steer the same task simultaneously:
+
+```
+Developer A (CLI):   gents attach a3f2 → "also fix the tests"
+Developer B (Web):   watching live → "make sure it's backwards compatible"
+Runner:              picks up both messages next turn, addresses both
+```
+
+### Latency
+
+Steering messages are picked up between turns. A turn might take 10-60 seconds. For faster control:
+
+- **Cancel** — a flag checked between tool calls within a turn (sub-second response)
+- **Pause** — same, finishes current tool call then stops
+
+---
+
+## Routing Rules
+
+Simplified webhook-to-task mapping. Configured in the dashboard or via API:
+
+```typescript
+interface RoutingRule {
+  id: string;
+  event: string;            // 'pull_request.opened', 'push', 'issues.labeled'
+  filter: {
+    branches?: string[];    // branch patterns
+    labels?: string[];      // label matches (for issues/PRs)
+    paths?: string[];       // file path patterns
+  };
+  blueprint: string;        // which agent blueprint to use
+  instructions: string;     // template with {{variables}} from the event
+  enabled: boolean;
+}
+```
+
+**Examples:**
+- PR opened → run security review agent
+- Push to main → run test suite
+- Issue labeled `gents:fix` → run fix agent on the issue
+
+Deduplication: one task per `(event_id, blueprint)` pair. Won't create duplicate tasks for the same webhook.
 
 ---
 
 ## Task Lifecycle
 
 ```
-Created → Queued → Running → Completed
-                          ↘ Failed
-                          ↘ Paused → Running (resumed)
-                          ↘ Cancelled
+pending → running → completed
+                 ↘ failed
+                 ↘ cancelled
 ```
+
+Simple. No paused/resumed states. If you want to "pause", cancel and re-dispatch.
 
 ### Task Creation
 
 Tasks can be created from:
-- **CLI** (`gents task create "..."`) — calls Gateway API
+- **CLI** (`gents dispatch "..."`) — calls POST /api/tasks
 - **Dashboard** — web UI form
-- **GitHub webhook** — issue/PR events matching routing rules
+- **GitHub webhook** — matched routing rule
 - **API** — programmatic access via API key
 
-### Task Execution
-
-```
-1. Gateway receives task creation request
-2. Gateway writes task metadata to Postgres (status: queued)
-3. Gateway dispatches Render Workflow with task ID
-4. Worker starts:
-   a. If task has a database (handoff): download .agent.db
-   b. If new task: create fresh .agent.db, run indexing
-5. Worker runs agent loop:
-   - Each turn: read from db, call LLM, execute tools, write to db
-   - After each turn: forward events to Gateway → Postgres
-   - Check for steering commands between turns
-6. Agent completes (or fails/times out)
-7. Worker marks task done, uploads final .agent.db to storage
-8. Gateway updates Postgres task status
-```
-
-### Steering
-
-Users can interact with running cloud agents:
-- **Send message** — inject a user message into the conversation (agent picks it up next turn)
-- **Pause** — agent finishes current turn then stops
-- **Resume** — paused agent continues
-- **Cancel** — agent stops, task marked cancelled
-- **Redirect** — send a new instruction that overrides the current task direction
-
-Steering commands are written to the agent's database (or a command queue table). The agent loop checks for commands between turns.
-
 ---
 
-## Storage Backend (Pluggable)
-
-Agent databases are transferred between local and cloud via a pluggable `StorageProvider`. This is simpler and more portable than syncing state through Postgres — the database file IS the state transfer mechanism.
-
-```typescript
-interface StorageProvider {
-  upload(localPath: string, key: string): Promise<string>
-  download(key: string, localPath: string): Promise<void>
-  list(prefix: string): Promise<StorageEntry[]>
-  delete(key: string): Promise<void>
-  getSignedUrl?(key: string, expiresIn: number): Promise<string>
-}
-```
-
-### Implementations
-
-| Provider | Config | Use Case |
-|---|---|---|
-| `storage-s3` | `{ bucket, region, credentials }` | AWS — widely supported, mature |
-| `storage-r2` | `{ bucket, accountId, credentials }` | Cloudflare R2 — S3-compatible, zero egress fees |
-| `storage-gcs` | `{ bucket, credentials }` | Google Cloud Storage |
-| `storage-render` | `{ serviceId }` | Render persistent disk (direct mount) |
-| `storage-local` | `{ basePath }` | Local filesystem — dev, single-machine setups |
-
-The storage provider is configured per deployment. A typical Render setup uses S3 or R2. Development uses `storage-local`. The Gateway config specifies which provider to use, and both CLI and Worker resolve the same provider.
-
-### Key Naming Convention
-
-```
-gents/<org>/<project>/<task-id>/agent.db        # Active task database
-gents/<org>/<project>/<task-id>/agent.db.final   # Completed task snapshot
-```
-
----
-
-## Handoff Protocol
-
-### Local → Cloud
-
-```
-User: gents handoff
-
-1. CLI reads current .agent.db
-2. CLI uploads .agent.db via StorageProvider
-3. CLI calls: POST /api/tasks
-   {
-     "type": "handoff",
-     "storage_key": "gents/org/project/task-id/agent.db",
-     "instructions": "Continue from where I left off"
-   }
-4. Gateway creates task, dispatches workflow
-5. Worker pulls .agent.db from storage to persistent disk
-6. Worker runs agent-loop against the database
-7. CLI receives task ID, can attach later
-```
-
-### Cloud → Local (Attach)
-
-```
-User: gents attach <task-id>
-
-1. CLI connects to: GET /api/tasks/<id>/events (SSE)
-2. Events stream to terminal in real-time
-3. User types messages → POST /api/tasks/<id>/messages
-4. Agent picks up messages next turn
-5. On exit: CLI can download final .agent.db
-```
-
-### Fork
-
-```
-User: gents fork [--from <task-id>] [--from <db-path>]
-
-1. CLI obtains source .agent.db (download from cloud or copy local)
-2. CLI creates new database file (copy)
-3. User provides new instructions
-4. Agent runs with full history context but new direction
-```
-
----
-
-## Services
-
-### auth
-
-- GitHub OAuth flow for web login
-- JWT token issuance and verification
-- API key management (create, rotate, revoke)
-- Role-based access (admin, member, viewer)
-- Middleware for Gateway routes
-
-### forge
-
-- GitHub webhook signature verification
-- Event parsing (issues, PRs, comments, pushes, labels)
-- Routing rules engine (label → task mapping, file pattern → task mapping)
-- Deduplication (don't create duplicate tasks for the same event)
-- Task template resolution (what instructions to give the agent for each event type)
-
-### task
-
-- Task CRUD operations
-- Event pagination and filtering
-- Status transitions with validation
-- Cost aggregation
-- Fork relationship tracking
-
-### sandbox (Phase 2+)
-
-- Cloud environment provisioning for agent execution
-- Repository cloning with token injection
-- Dependency installation
-- Isolated filesystem per task
-- Resource limits (CPU, memory, disk)
-
-### deploy (Phase 2+, if needed)
-
-- Preview environment management
-- Deploy on PR creation, tear down on merge/close
-- Integration with Render deploy API
-
----
-
-## Event Forwarding and Data Modeling
-
-### Three-Tier Read Pattern (from openforge-v2)
-
-Proven pattern carried forward: raw events for audit, denormalized current state for API, time-bucketed rollups for dashboards.
-
-```
-Agent DB (SQLite)          Gateway             Postgres
-     │                       │                    │
-     │  events written       │                    │
-     │  during turn          │                    │
-     │                       │                    │
-     │  POST /api/tasks/     │                    │
-     │  <id>/events          │                    │
-     │──────────────────────►│                    │
-     │                       │  INSERT INTO       │
-     │                       │  task_events       │
-     │                       │  (raw events)      │
-     │                       │───────────────────►│
-     │                       │                    │
-     │                       │  UPDATE tasks      │
-     │                       │  (denormalized)    │
-     │                       │───────────────────►│
-     │                       │                    │
-     │                       │  UPSERT            │
-     │                       │  task_metrics_     │
-     │                       │  hourly            │
-     │                       │───────────────────►│
-     │                       │                    │
-     │                       │  SSE broadcast     │
-     │                       │───────────────────►│ Dashboard
-     │                       │                    │
-```
-
-### Postgres Schema (Fleet View)
+## Postgres Schema
 
 ```sql
--- Tier 1: Raw events (append-only, per-task)
-CREATE TABLE task_events (
-  id TEXT NOT NULL,
-  task_id TEXT NOT NULL,
-  type TEXT NOT NULL,
-  version SMALLINT NOT NULL DEFAULT 1,
-  ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  payload JSONB NOT NULL DEFAULT '{}'::jsonb
-);
-CREATE INDEX idx_task_events_task_ts ON task_events(task_id, ts);
-CREATE INDEX idx_task_events_task_type ON task_events(task_id, type, ts);
-
--- Tier 2: Denormalized current state (one row per task)
 CREATE TABLE tasks (
   id TEXT PRIMARY KEY,
   status TEXT NOT NULL DEFAULT 'pending',
-  description TEXT,
-  repo_url TEXT,
-  model TEXT,
-  origin TEXT,                          -- 'cli', 'dashboard', 'webhook', 'api'
-  blueprint TEXT,                       -- which AgentBlueprint was used
-  storage_key TEXT,                     -- location of .agent.db in storage
-  total_input_tokens BIGINT DEFAULT 0,
-  total_output_tokens BIGINT DEFAULT 0,
-  total_cost_usd NUMERIC DEFAULT 0,
+  blueprint TEXT,
+  repo TEXT,
+  ref TEXT,
+  instructions TEXT,
+  origin TEXT,              -- 'webhook', 'cli', 'schedule', 'dashboard'
+  workflow_id TEXT,          -- reference to WorkflowService run
+  sandbox_id TEXT,          -- reference to SandboxService instance
+  cost_usd NUMERIC DEFAULT 0,
   turn_count INTEGER DEFAULT 0,
-  tool_call_count INTEGER DEFAULT 0,
   last_error TEXT,
   created_by TEXT,
-  parent_task_id TEXT,                  -- for forks
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW(),
-  completed_at TIMESTAMPTZ
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  result JSONB,             -- PR URL, comments posted, test results, etc.
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Tier 3: Time-series rollups (hourly buckets)
-CREATE TABLE task_metrics_hourly (
-  task_id TEXT NOT NULL,
-  hour TIMESTAMPTZ NOT NULL,
-  input_tokens BIGINT NOT NULL DEFAULT 0,
-  output_tokens BIGINT NOT NULL DEFAULT 0,
-  cached_input_tokens BIGINT NOT NULL DEFAULT 0,
-  cost_usd NUMERIC NOT NULL DEFAULT 0,
-  tool_calls INTEGER NOT NULL DEFAULT 0,
-  messages INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (task_id, hour)
+CREATE TABLE task_logs (
+  id SERIAL PRIMARY KEY,
+  task_id TEXT REFERENCES tasks(id),
+  type TEXT NOT NULL,       -- 'message', 'tool_call', 'tool_result', 'error', 'status'
+  role TEXT,                -- 'assistant', 'system'
+  content JSONB NOT NULL,
+  ts TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_task_logs_task_ts ON task_logs(task_id, ts);
+
+CREATE TABLE task_messages (
+  id SERIAL PRIMARY KEY,
+  task_id TEXT REFERENCES tasks(id),
+  content TEXT NOT NULL,
+  sent_by TEXT,             -- user ID or 'cli'
+  picked_up BOOLEAN DEFAULT false,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_task_messages_pending ON task_messages(task_id, picked_up) WHERE NOT picked_up;
+
+CREATE TABLE routing_rules (
+  id TEXT PRIMARY KEY,
+  event TEXT NOT NULL,
+  filter JSONB DEFAULT '{}'::jsonb,
+  blueprint TEXT NOT NULL,
+  instructions TEXT NOT NULL,
+  enabled BOOLEAN DEFAULT true,
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 ```
 
-### Event Processing in Gateway
-
-On receiving forwarded events, the Gateway executes all three writes in a single transaction:
-
-1. **INSERT** raw event into `task_events`
-2. **UPDATE** `tasks` row with projection (status transitions, cost increments, error tracking)
-3. **UPSERT** `task_metrics_hourly` with bucketed counters
-
-Only three event types feed the hourly rollup (same as openforge-v2):
-- `agent.cost.incurred` → tokens, cost
-- `agent.tool.succeeded` → tool_calls
-- `message.sent` → messages
-
-### Replayable Projections
-
-The `tasks` denormalized row can be reconstructed by replaying `task_events`. This is used for:
-- Fork accounting (reset semantic state, preserve numeric totals)
-- Data integrity verification
-- Migration and schema evolution
-
-The worker forwards events in batches after each turn. If the network is unavailable, events queue locally in the agent-db and forward on recovery.
-
 ---
 
-## Infrastructure (Render)
+## Infrastructure
+
+### render.yaml
 
 ```yaml
-# render.yaml
 services:
   - type: web
-    name: gents-gateway
+    name: gents
     runtime: node
     buildCommand: pnpm install && pnpm build
-    startCommand: bun apps/gateway/src/index.ts
+    startCommand: pnpm start
     healthCheckPath: /api/health
     envVars:
       - key: DATABASE_URL
         fromDatabase:
           name: gents-db
           property: connectionString
-      - key: GITHUB_CLIENT_ID
+      - key: GITHUB_APP_PRIVATE_KEY
         sync: false
-      - key: GITHUB_CLIENT_SECRET
+      - key: GITHUB_APP_ID
         sync: false
-      - key: JWT_SECRET
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: NEXTAUTH_SECRET
         generateValue: true
-
-  - type: web
-    name: gents-web
-    runtime: node
-    buildCommand: pnpm install && pnpm --filter @gents/web build
-    startCommand: pnpm --filter @gents/web start
-    envVars:
-      - key: NEXT_PUBLIC_API_URL
-        fromService:
-          name: gents-gateway
-          type: web
-          property: url
+      - key: SANDBOX_PROVIDER
+        value: e2b
+      - key: SANDBOX_API_KEY
+        sync: false
 
 databases:
   - name: gents-db
-    plan: standard
+    plan: starter
     postgresMajorVersion: 16
 ```
 
-The worker runs as a separate Render Workflow (configured outside the Blueprint, triggered via Render API from the Gateway).
+One web service. One database. Workflows orchestrate execution. Sandboxes are provisioned externally via the SandboxService.
+
+### Environment Configuration
+
+| Variable | Purpose |
+|---|---|
+| `SANDBOX_PROVIDER` | Which sandbox provider to use (`e2b`, `fly`, `modal`, `docker`) |
+| `SANDBOX_API_KEY` | API key for the sandbox provider |
+| `RENDER_API_KEY` | For dispatching Render Workflows |
+| `ANTHROPIC_API_KEY` | Passed to runners for LLM calls |
+| `GITHUB_APP_PRIVATE_KEY` | For GitHub API access and webhook verification |
 
 ---
 
 ## Cost Model
 
-### Per-Agent Costs
+### Per-Task Costs
 
-- LLM tokens (primary cost) — tracked per-turn in agent-db, aggregated to Postgres
-- Embedding generation (indexing) — local Nomic Embed, no API cost
-- Compute (Render Workflow) — per-minute while running
-- Storage (persistent disk + object storage) — per-GB
+- **LLM tokens** — primary cost, tracked per-turn by the runner
+- **Embedding generation** — local Nomic Embed in the sandbox, no API cost
+- **Sandbox compute** — per-minute while running (provider-specific pricing)
+- **Workflow compute** — Render Workflow billing
 
 ### Controls
 
-- Per-task cost limits (set at creation)
-- Per-user daily/monthly budgets
-- Per-organization fleet limits
-- Cost guard hook pauses agent before exceeding limit
-- Dashboard shows real-time spend across fleet
+- Per-task cost limits (set in RunnerSpec constraints)
+- Per-blueprint default limits
+- Global daily/monthly budget (enforced by Next.js app before dispatching)
+- Cost guard hook in the agent loop pauses before exceeding limit
+
+---
+
+## Deployment Guide (Small Team)
+
+1. Fork the gents repo
+2. `render deploy` (or connect repo to Render)
+3. Set environment variables (GitHub App, Anthropic key, sandbox provider key)
+4. Configure routing rules in the dashboard
+5. Agents start running on GitHub events
+
+Total setup time: ~15 minutes.

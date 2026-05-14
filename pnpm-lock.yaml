@@ -31,9 +31,6 @@ importers:
       '@gents/agent-tools':
         specifier: workspace:*
         version: link:../../packages/agent/tools
-      '@opentelemetry/api':
-        specifier: ^1.9.0
-        version: 1.9.1
       commander:
         specifier: ^13.0.0
         version: 13.1.0
@@ -63,9 +60,9 @@ importers:
 
   packages/agent/db:
     dependencies:
-      zod:
-        specifier: ^3.24.0
-        version: 3.25.76
+      '@sqliteai/sqlite-sync':
+        specifier: ^1.0.0
+        version: 1.0.18
     devDependencies:
       bun-types:
         specifier: latest
@@ -562,6 +559,52 @@ packages:
     resolution: {integrity: sha512-hPt/bgL5cE+Qp+/TPHBqptcAgPzgj46mPcg/16zNUmbQk0j+mOEQV/+Lqu8QRtDV3Ek95Q6FeFITpuhl6OTsAA==}
     cpu: [x64]
     os: [win32]
+
+  '@sqliteai/sqlite-sync-darwin-arm64@1.0.18':
+    resolution: {integrity: sha512-teBVmfs24i9cqusLFyQVYYSoKW8E5bL734r+/lqE5MzdC/rMVYbJr0BIgrfJW8c2E76xlQYxr8fRWFLOVZ7A7A==}
+    engines: {node: '>=16.0.0'}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@sqliteai/sqlite-sync-darwin-x86_64@1.0.18':
+    resolution: {integrity: sha512-U0KuAxTpY2oHNvHAFCcxc2HmDuEd6g7Dx7BL+A2bqXOfjPK2wolPQXdsWQVY/IgjQg+lyUUpx13XqkFymjL+rg==}
+    engines: {node: '>=16.0.0'}
+    cpu: [x64, ia32]
+    os: [darwin]
+
+  '@sqliteai/sqlite-sync-linux-arm64-musl@1.0.18':
+    resolution: {integrity: sha512-VkNibl4T6W5u7bFJ2YA7wfOdc90SM1exYpkcuCiY+2vDSO/M+2qgMwUbPyWbdYABrJ7owAsLc3n4HajWjKw6Pg==}
+    engines: {node: '>=16.0.0'}
+    cpu: [arm64]
+    os: [linux]
+
+  '@sqliteai/sqlite-sync-linux-arm64@1.0.18':
+    resolution: {integrity: sha512-TrFqsointgzrKIGBt65a/kIqIV1lXLrf+jUmfQNozvJewrX0a4tkvrPRsS6P6NdjljsoG9/ndHLxUWSkCnjA9g==}
+    engines: {node: '>=16.0.0'}
+    cpu: [arm64]
+    os: [linux]
+
+  '@sqliteai/sqlite-sync-linux-x86_64-musl@1.0.18':
+    resolution: {integrity: sha512-2D2xZ/i9YkXaXBMJrlxfDjnDfcTPYcO1tL90wEkw4R4rG4/jIi6VPm+uxTfDq2CEsshxfACYdM4R3r75/dosSg==}
+    engines: {node: '>=16.0.0'}
+    cpu: [x64, ia32]
+    os: [linux]
+
+  '@sqliteai/sqlite-sync-linux-x86_64@1.0.18':
+    resolution: {integrity: sha512-pa8jLHvHj1zJMTVm4krWZA18+UIF+XedUmwFtc0qZ4RhuB4WjIohuUALiyqZZIT0RpipF1jWwl9gQ6Xu+XZjog==}
+    engines: {node: '>=16.0.0'}
+    cpu: [x64, ia32]
+    os: [linux]
+
+  '@sqliteai/sqlite-sync-win32-x86_64@1.0.18':
+    resolution: {integrity: sha512-F9I3Z3xwxNTS4wk3v26yKKvp/TDHZV8/35Rmpb6U9yKknHznPaitn05IxsRtF9YIv3Z55wBLxAgCbUwdjE/wnw==}
+    engines: {node: '>=16.0.0'}
+    cpu: [x64, ia32]
+    os: [win32]
+
+  '@sqliteai/sqlite-sync@1.0.18':
+    resolution: {integrity: sha512-IohNYa1s+V5G9iaISJ1m5jZLC3PxU/3wmWov/tBX5SZy26wrA4RsMiv8XApw5qQBwWwFc9XKKURN1U0oJY9BRw==}
+    engines: {node: '>=16.0.0'}
 
   '@stablelib/base64@1.0.1':
     resolution: {integrity: sha512-1bnPQqSxSuc3Ii6MhBysoWCg58j97aUjuCSZrGSmDxNqtytIi0k8utUenAwTZN4V5mXXYGsVUI9zeBqy+jBOSQ==}
@@ -1492,6 +1535,37 @@ snapshots:
 
   '@rollup/rollup-win32-x64-msvc@4.60.3':
     optional: true
+
+  '@sqliteai/sqlite-sync-darwin-arm64@1.0.18':
+    optional: true
+
+  '@sqliteai/sqlite-sync-darwin-x86_64@1.0.18':
+    optional: true
+
+  '@sqliteai/sqlite-sync-linux-arm64-musl@1.0.18':
+    optional: true
+
+  '@sqliteai/sqlite-sync-linux-arm64@1.0.18':
+    optional: true
+
+  '@sqliteai/sqlite-sync-linux-x86_64-musl@1.0.18':
+    optional: true
+
+  '@sqliteai/sqlite-sync-linux-x86_64@1.0.18':
+    optional: true
+
+  '@sqliteai/sqlite-sync-win32-x86_64@1.0.18':
+    optional: true
+
+  '@sqliteai/sqlite-sync@1.0.18':
+    optionalDependencies:
+      '@sqliteai/sqlite-sync-darwin-arm64': 1.0.18
+      '@sqliteai/sqlite-sync-darwin-x86_64': 1.0.18
+      '@sqliteai/sqlite-sync-linux-arm64': 1.0.18
+      '@sqliteai/sqlite-sync-linux-arm64-musl': 1.0.18
+      '@sqliteai/sqlite-sync-linux-x86_64': 1.0.18
+      '@sqliteai/sqlite-sync-linux-x86_64-musl': 1.0.18
+      '@sqliteai/sqlite-sync-win32-x86_64': 1.0.18
 
   '@stablelib/base64@1.0.1': {}
 
