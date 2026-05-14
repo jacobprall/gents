@@ -81,7 +81,7 @@ step "Installing dependencies"
 cd "$SCRIPT_DIR"
 info "Running pnpm install..."
 pnpm install
-success "Dependencies installed (including @sqliteai/sqlite-sync)"
+success "Dependencies installed (including sqlite-vector, sqlite-ai, sqlite-sync)"
 
 # ─── 5. Build the project ────────────────────────────────────────
 step "Building project"
@@ -90,7 +90,89 @@ info "Running pnpm build..."
 pnpm build
 success "Build complete"
 
-# ─── 6. Link the CLI ─────────────────────────────────────────────
+# ─── 6. Verify SQLite extensions ─────────────────────────────────
+step "SQLite Extensions"
+
+info "Verifying sqlite-vector and sqlite-ai native extensions..."
+
+VECTOR_OK=0
+AI_OK=0
+
+VECTOR_PATH=$(bun -e "
+  try {
+    const { getExtensionPath } = require('@sqliteai/sqlite-vector');
+    process.stdout.write(getExtensionPath());
+  } catch(e) {
+    process.stderr.write(e.message);
+    process.exit(1);
+  }
+" 2>/dev/null) && VECTOR_OK=1
+
+AI_PATH=$(bun -e "
+  try {
+    const { getExtensionPath } = require('@sqliteai/sqlite-ai');
+    process.stdout.write(getExtensionPath());
+  } catch(e) {
+    process.stderr.write(e.message);
+    process.exit(1);
+  }
+" 2>/dev/null) && AI_OK=1
+
+if [ "$VECTOR_OK" -eq 1 ]; then
+  success "sqlite-vector extension found ($VECTOR_PATH)"
+else
+  warn "sqlite-vector extension not found — vector search will be unavailable"
+  warn "Try: pnpm install --force (in $SCRIPT_DIR)"
+fi
+
+if [ "$AI_OK" -eq 1 ]; then
+  success "sqlite-ai extension found ($AI_PATH)"
+else
+  warn "sqlite-ai extension not found — local embeddings will be unavailable"
+  warn "Try: pnpm install --force (in $SCRIPT_DIR)"
+fi
+
+if [ "$VECTOR_OK" -eq 0 ] && [ "$AI_OK" -eq 0 ]; then
+  warn "No SQLite extensions loaded — semantic search features will be fully unavailable"
+fi
+
+# ─── 7. Download embedding model ─────────────────────────────────
+step "Embedding Model"
+
+NOMIC_MODEL_DIR="$GENTS_CONFIG_DIR/models"
+NOMIC_MODEL_FILE="nomic-embed-text-v1.5.Q8_0.gguf"
+NOMIC_MODEL_PATH="$NOMIC_MODEL_DIR/$NOMIC_MODEL_FILE"
+NOMIC_MODEL_URL="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/$NOMIC_MODEL_FILE"
+
+if [ -f "$NOMIC_MODEL_PATH" ]; then
+  MODEL_SIZE=$(du -h "$NOMIC_MODEL_PATH" | cut -f1 | xargs)
+  success "Nomic Embed v1.5 already downloaded ($MODEL_SIZE at $NOMIC_MODEL_PATH)"
+else
+  info "Nomic Embed Text v1.5 (Q8_0, ~146 MB) is required for local code embeddings."
+  printf "  ${YELLOW}?${RESET} Download now? [Y/n] "
+  read -r DOWNLOAD_CONFIRM
+
+  if [ -z "$DOWNLOAD_CONFIRM" ] || [ "$DOWNLOAD_CONFIRM" = "y" ] || [ "$DOWNLOAD_CONFIRM" = "Y" ]; then
+    mkdir -p "$NOMIC_MODEL_DIR"
+    info "Downloading from Hugging Face..."
+    if curl -fL --progress-bar -o "$NOMIC_MODEL_PATH.tmp" "$NOMIC_MODEL_URL"; then
+      mv "$NOMIC_MODEL_PATH.tmp" "$NOMIC_MODEL_PATH"
+      MODEL_SIZE=$(du -h "$NOMIC_MODEL_PATH" | cut -f1 | xargs)
+      success "Nomic Embed v1.5 downloaded ($MODEL_SIZE)"
+    else
+      rm -f "$NOMIC_MODEL_PATH.tmp"
+      warn "Download failed. You can retry later with:"
+      info "  curl -fL -o '$NOMIC_MODEL_PATH' '$NOMIC_MODEL_URL'"
+    fi
+  else
+    warn "Embedding model download skipped. Local code search will be unavailable."
+    info "Download later with:"
+    info "  mkdir -p '$NOMIC_MODEL_DIR'"
+    info "  curl -fL -o '$NOMIC_MODEL_PATH' '$NOMIC_MODEL_URL'"
+  fi
+fi
+
+# ─── 8. Link the CLI ─────────────────────────────────────────────
 step "Setting up CLI"
 
 info "Linking gents CLI globally..."
@@ -111,7 +193,7 @@ else
   info "  alias gents='bun $GENTS_BIN'"
 fi
 
-# ─── 7. Set up global config & prompt for API keys ───────────────
+# ─── 9. Set up global config & prompt for API keys ───────────────
 step "Configuration"
 
 mkdir -p "$GENTS_CONFIG_DIR"
@@ -218,7 +300,7 @@ if [ -f "$GENTS_CONFIG_FILE" ]; then
   success "Config permissions set to 600"
 fi
 
-# ─── 8. Set up default config values ─────────────────────────────
+# ─── 10. Set up default config values ────────────────────────────
 step "Default settings"
 
 HAS_MODEL=$(read_config_key "model")
@@ -227,7 +309,7 @@ if [ -z "$HAS_MODEL" ]; then
   info "Override anytime with: gents config set model <model-name>"
 fi
 
-# ─── 9. Run doctor ───────────────────────────────────────────────
+# ─── 11. Run doctor ──────────────────────────────────────────────
 step "Running gents doctor"
 
 GENTS_BIN="$SCRIPT_DIR/apps/cli/src/index.ts"

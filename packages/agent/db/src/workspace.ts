@@ -24,16 +24,24 @@ function getCurrentSchemaVersion(database: Database): number {
   }
 }
 
-function extensionCandidates(baseDir: string): string[] {
-  const ext = process.platform === "darwin" ? "dylib" : process.platform === "win32" ? "dll" : "so";
-  const names = [
-    `libsqlite_vector.${ext}`,
-    `libsqlite_ai.${ext}`,
-    `sqlite_vector.${ext}`,
-    `sqlite_ai.${ext}`,
-    `cloudsync.${ext}`,
-  ];
-  return names.map((n) => join(baseDir, n));
+function tryLoadVectorExtension(database: Database): boolean {
+  try {
+    const { getExtensionPath } = require("@sqliteai/sqlite-vector") as { getExtensionPath: () => string };
+    database.loadExtension(getExtensionPath());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function tryLoadAIExtension(database: Database): boolean {
+  try {
+    const { getExtensionPath } = require("@sqliteai/sqlite-ai") as { getExtensionPath: () => string };
+    database.loadExtension(getExtensionPath());
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function tryLoadSyncExtension(database: Database): boolean {
@@ -46,7 +54,19 @@ function tryLoadSyncExtension(database: Database): boolean {
   }
 }
 
-function tryLoadExtensions(database: Database, modelPath: string): boolean {
+function extensionCandidates(baseDir: string): string[] {
+  const ext = process.platform === "darwin" ? "dylib" : process.platform === "win32" ? "dll" : "so";
+  const names = [
+    `libsqlite_vector.${ext}`,
+    `libsqlite_ai.${ext}`,
+    `sqlite_vector.${ext}`,
+    `sqlite_ai.${ext}`,
+    `cloudsync.${ext}`,
+  ];
+  return names.map((n) => join(baseDir, n));
+}
+
+function tryLoadExtensionsFromPath(database: Database, modelPath: string): boolean {
   let anyLoaded = false;
   let base: string;
   try {
@@ -99,9 +119,17 @@ export function createWorkspaceDB(
   }
 
   let modelLoaded = false;
-  if (opts?.modelPath) {
+  try {
+    const vectorOk = tryLoadVectorExtension(database);
+    const aiOk = tryLoadAIExtension(database);
+    modelLoaded = vectorOk || aiOk;
+  } catch {
+    modelLoaded = false;
+  }
+
+  if (!modelLoaded && opts?.modelPath) {
     try {
-      modelLoaded = tryLoadExtensions(database, opts.modelPath);
+      modelLoaded = tryLoadExtensionsFromPath(database, opts.modelPath);
     } catch {
       modelLoaded = false;
     }

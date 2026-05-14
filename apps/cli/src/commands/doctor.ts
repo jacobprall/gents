@@ -217,54 +217,38 @@ function checkSessions(repoPath: string): Check {
   }
 }
 
-function checkSqliteExtensions(repoPath: string): Check {
-  const dbPath = getDbPath(repoPath, "default");
-  if (!existsSync(dbPath)) {
-    return {
-      label: "SQLite extensions",
-      status: "warn",
-      detail: "No database to test — run gents chat first, then re-check",
-      group: "Runtime",
-    };
-  }
+function checkSqliteExtensions(_repoPath: string): Check {
+  const { Database } = require("bun:sqlite") as typeof import("bun:sqlite");
+  const exts: string[] = [];
 
   try {
-    const { Database } = require("bun:sqlite") as typeof import("bun:sqlite");
-    const db = new Database(dbPath, { readonly: true });
-    const exts: string[] = [];
+    const db = new Database(":memory:");
 
     try {
-      db.prepare("SELECT vector_version()").get();
+      const { getExtensionPath } = require("@sqliteai/sqlite-vector") as { getExtensionPath: () => string };
+      db.loadExtension(getExtensionPath());
       exts.push("sqlite-vector");
     } catch {
-      /* not loaded */
+      /* not installed */
     }
 
     try {
-      db.prepare("SELECT llm_version()").get();
+      const { getExtensionPath } = require("@sqliteai/sqlite-ai") as { getExtensionPath: () => string };
+      db.loadExtension(getExtensionPath());
       exts.push("sqlite-ai");
     } catch {
-      /* not loaded */
+      /* not installed */
     }
 
     try {
-      db.prepare("SELECT cloudsync_version()").get();
+      const { getExtensionPath } = require("@sqliteai/sqlite-sync") as { getExtensionPath: () => string };
+      db.loadExtension(getExtensionPath());
       exts.push("sqlite-sync");
     } catch {
-      /* not loaded */
+      /* not installed */
     }
 
     db.close();
-
-    if (exts.length === 0) {
-      return {
-        label: "SQLite extensions",
-        status: "warn",
-        detail: "Neither sqlite-vector nor sqlite-ai detected — semantic search and local embeddings unavailable",
-        group: "Runtime",
-      };
-    }
-    return { label: "SQLite extensions", status: "pass", detail: exts.join(", "), group: "Runtime" };
   } catch (e) {
     return {
       label: "SQLite extensions",
@@ -272,6 +256,53 @@ function checkSqliteExtensions(repoPath: string): Check {
       detail: `Could not probe: ${e instanceof Error ? e.message : String(e)}`,
       group: "Runtime",
     };
+  }
+
+  if (exts.length === 0) {
+    return {
+      label: "SQLite extensions",
+      status: "fail",
+      detail: "No extensions found — run: pnpm install --force (in project root)",
+      group: "Runtime",
+    };
+  }
+
+  const missing: string[] = [];
+  if (!exts.includes("sqlite-vector")) missing.push("sqlite-vector");
+  if (!exts.includes("sqlite-ai")) missing.push("sqlite-ai");
+
+  if (missing.length > 0) {
+    return {
+      label: "SQLite extensions",
+      status: "warn",
+      detail: `Loaded: ${exts.join(", ")}. Missing: ${missing.join(", ")}`,
+      group: "Runtime",
+    };
+  }
+
+  return { label: "SQLite extensions", status: "pass", detail: exts.join(", "), group: "Runtime" };
+}
+
+function checkEmbeddingModel(): Check {
+  const modelsDir = path.join(process.env.HOME ?? "~", ".gents", "models");
+  const modelFile = "nomic-embed-text-v1.5.Q8_0.gguf";
+  const modelPath = path.join(modelsDir, modelFile);
+
+  if (!existsSync(modelPath)) {
+    return {
+      label: "Embedding model",
+      status: "fail",
+      detail: `${modelFile} not found at ${modelsDir}. Run setup.sh or download manually.`,
+      group: "Runtime",
+    };
+  }
+
+  try {
+    const st = statSync(modelPath);
+    const sizeMb = (st.size / (1024 * 1024)).toFixed(0);
+    return { label: "Embedding model", status: "pass", detail: `${modelFile} (${sizeMb} MB)`, group: "Runtime" };
+  } catch {
+    return { label: "Embedding model", status: "warn", detail: "Could not stat model file", group: "Runtime" };
   }
 }
 
@@ -286,6 +317,7 @@ export const doctorCommand = new Command("doctor")
       checkBunRuntime(),
       await checkGit(),
       checkSqliteExtensions(repoPath),
+      checkEmbeddingModel(),
       ...checkApiKeys(),
       checkGlobalConfig(),
       checkConfigPermissions(),

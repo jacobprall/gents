@@ -6,16 +6,24 @@ import { sqlError } from "./errors";
 import type { AgentBlueprint, AgentDB, CreateDBOptions } from "./types";
 import { MIGRATIONS, SCHEMA_SQL, SCHEMA_VERSION } from "./schema";
 
-function extensionCandidates(baseDir: string): string[] {
-  const ext = process.platform === "darwin" ? "dylib" : process.platform === "win32" ? "dll" : "so";
-  const names = [
-    `libsqlite_vector.${ext}`,
-    `libsqlite_ai.${ext}`,
-    `sqlite_vector.${ext}`,
-    `sqlite_ai.${ext}`,
-    `cloudsync.${ext}`,
-  ];
-  return names.map((n) => join(baseDir, n));
+function tryLoadVectorExtension(database: Database): boolean {
+  try {
+    const { getExtensionPath } = require("@sqliteai/sqlite-vector") as { getExtensionPath: () => string };
+    database.loadExtension(getExtensionPath());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function tryLoadAIExtension(database: Database): boolean {
+  try {
+    const { getExtensionPath } = require("@sqliteai/sqlite-ai") as { getExtensionPath: () => string };
+    database.loadExtension(getExtensionPath());
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function tryLoadSyncExtension(database: Database): boolean {
@@ -26,6 +34,18 @@ function tryLoadSyncExtension(database: Database): boolean {
   } catch {
     return false;
   }
+}
+
+function extensionCandidates(baseDir: string): string[] {
+  const ext = process.platform === "darwin" ? "dylib" : process.platform === "win32" ? "dll" : "so";
+  const names = [
+    `libsqlite_vector.${ext}`,
+    `libsqlite_ai.${ext}`,
+    `sqlite_vector.${ext}`,
+    `sqlite_ai.${ext}`,
+    `cloudsync.${ext}`,
+  ];
+  return names.map((n) => join(baseDir, n));
 }
 
 function resolveExtensionBase(modelPath: string): string {
@@ -117,8 +137,16 @@ export function createAgentDB(dbPath: string, opts?: CreateDBOptions): AgentDB {
   }
 
   let modelLoaded = false;
+  try {
+    const vectorOk = tryLoadVectorExtension(database);
+    const aiOk = tryLoadAIExtension(database);
+    modelLoaded = vectorOk || aiOk;
+  } catch {
+    modelLoaded = false;
+  }
+
   const modelPath = opts?.modelPath;
-  if (modelPath) {
+  if (!modelLoaded && modelPath) {
     try {
       modelLoaded = tryLoadSqliteExtensions(database, modelPath);
     } catch {

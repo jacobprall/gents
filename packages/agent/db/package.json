@@ -10,7 +10,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@sqliteai/sqlite-sync": "^1.0.0"
+    "@sqliteai/sqlite-ai": "^0.7.56",
+    "@sqliteai/sqlite-sync": "^1.0.0",
+    "@sqliteai/sqlite-vector": "^0.9.45"
   },
   "devDependencies": {
     "bun-types": "latest",
