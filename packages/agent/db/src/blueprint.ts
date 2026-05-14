@@ -57,6 +57,7 @@ const defaultTool = (name: string, description: string, inputSchema: Record<stri
 
 export const DEFAULT_BLUEPRINT: AgentBlueprint = {
   name: "gents-default",
+  description: "General-purpose coding assistant",
   tools: [
     defaultTool("read_file", "Read file contents at a path.", {
       type: "object",
@@ -148,14 +149,18 @@ export function applyBlueprint(db: AgentDB, blueprint: AgentBlueprint): void {
       const id = generateUUIDv7();
       db.db
         .prepare(
-          `INSERT INTO messages (id, turn, role, content, tool_calls, tool_call_id, tokens_in, tokens_out, cost_usd, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?)`,
+          `INSERT INTO messages (id, turn, role, content, tool_calls, tool_call_id, tokens_in, tokens_out, cost_usd, session_id, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
         )
-        .run(id, 0, "system", blueprint.systemInstructions, null, null, null, null, null, now);
+        .run(id, 0, "system", blueprint.systemInstructions, null, null, null, null, null, null, now);
     }
 
     if (blueprint.name) {
       db.db.prepare(`INSERT OR REPLACE INTO config (key, value) VALUES (?,?)`).run("blueprint_name", blueprint.name);
+    }
+
+    if (blueprint.description) {
+      db.db.prepare(`INSERT OR REPLACE INTO config (key, value) VALUES (?,?)`).run("blueprint_description", blueprint.description);
     }
 
     if (blueprint.seedMessages != null) {
@@ -163,8 +168,8 @@ export function applyBlueprint(db: AgentDB, blueprint: AgentBlueprint): void {
         const id = generateUUIDv7();
         db.db
           .prepare(
-            `INSERT INTO messages (id, turn, role, content, tool_calls, tool_call_id, tokens_in, tokens_out, cost_usd, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            `INSERT INTO messages (id, turn, role, content, tool_calls, tool_call_id, tokens_in, tokens_out, cost_usd, session_id, created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
           )
           .run(
             id,
@@ -176,6 +181,7 @@ export function applyBlueprint(db: AgentDB, blueprint: AgentBlueprint): void {
             msg.tokensIn ?? null,
             msg.tokensOut ?? null,
             msg.costUsd ?? null,
+            null,
             now,
           );
       }

@@ -29,6 +29,7 @@ function rowToEvent(row: EventRow): Event {
 export function appendEvent(db: AgentDB, event: NewEvent): Event {
   const id = generateUUIDv7();
   const createdAt = Date.now();
+  const sid = db.activeSessionId ?? null;
   let payloadJson: string;
   try {
     payloadJson = JSON.stringify(event.payload);
@@ -37,8 +38,8 @@ export function appendEvent(db: AgentDB, event: NewEvent): Event {
   }
   try {
     db.db
-      .prepare(`INSERT INTO events (id, type, payload, turn, created_at) VALUES (?,?,?,?,?)`)
-      .run(id, event.type, payloadJson, event.turn ?? null, createdAt);
+      .prepare(`INSERT INTO events (id, type, payload, turn, session_id, created_at) VALUES (?,?,?,?,?,?)`)
+      .run(id, event.type, payloadJson, event.turn ?? null, sid, createdAt);
   } catch (e) {
     throw sqlError("appendEvent", e);
   }
@@ -53,11 +54,27 @@ export function appendEvent(db: AgentDB, event: NewEvent): Event {
 
 export function getEvents(
   db: AgentDB,
-  opts?: { type?: string; limit?: number; offset?: number },
+  opts?: { type?: string; limit?: number; offset?: number; sessionId?: string },
 ): Event[] {
+  const sid = opts?.sessionId ?? db.activeSessionId ?? null;
   try {
     const limit = Math.max(1, opts?.limit ?? 100);
     const offset = Math.max(0, opts?.offset ?? 0);
+
+    if (sid && opts?.type != null) {
+      return (
+        db.db
+          .prepare(`SELECT id, type, payload, turn, created_at FROM events WHERE session_id = ? AND type = ? ORDER BY created_at ASC LIMIT ? OFFSET ?`)
+          .all(sid, opts.type, limit, offset) as EventRow[]
+      ).map(rowToEvent);
+    }
+    if (sid) {
+      return (
+        db.db
+          .prepare(`SELECT id, type, payload, turn, created_at FROM events WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?`)
+          .all(sid, limit, offset) as EventRow[]
+      ).map(rowToEvent);
+    }
     if (opts?.type != null) {
       return (
         db.db
@@ -76,10 +93,18 @@ export function getEvents(
 }
 
 export function getLastEvent(db: AgentDB): Event | undefined {
+  const sid = db.activeSessionId ?? null;
   try {
-    const row = db.db
-      .prepare(`SELECT id, type, payload, turn, created_at FROM events ORDER BY created_at DESC LIMIT 1`)
-      .get() as EventRow | undefined;
+    let row: EventRow | undefined;
+    if (sid) {
+      row = db.db
+        .prepare(`SELECT id, type, payload, turn, created_at FROM events WHERE session_id = ? ORDER BY created_at DESC LIMIT 1`)
+        .get(sid) as EventRow | undefined;
+    } else {
+      row = db.db
+        .prepare(`SELECT id, type, payload, turn, created_at FROM events ORDER BY created_at DESC LIMIT 1`)
+        .get() as EventRow | undefined;
+    }
     return row ? rowToEvent(row) : undefined;
   } catch (e) {
     throw sqlError("getLastEvent", e);

@@ -28,6 +28,8 @@ export interface AgentDB {
   readonly siteId?: string;
   /** Shared workspace index. When set, search/index operations use this DB. */
   readonly workspace?: WorkspaceDB;
+  /** Active session ID. Set via setActiveSession(). Scopes messages/events/metrics writes. */
+  activeSessionId?: string;
   /** @deprecated Use workspace.vectorAvailable instead when workspace is set. */
   vectorAvailable?: boolean;
 }
@@ -65,6 +67,7 @@ export interface SubagentDef {
 
 export interface AgentBlueprint {
   name: string;
+  description?: string;
   tools: ToolDef[];
   permissions: Permission[];
   excludePatterns: string[];
@@ -73,6 +76,23 @@ export interface AgentBlueprint {
   systemInstructions?: string;
   skills?: Skill[];
   subagents?: SubagentDef[];
+}
+
+export interface Session {
+  id: string;
+  label: string | null;
+  createdAt: number;
+  lastActiveAt: number;
+  isActive: boolean;
+}
+
+export interface SessionSummary {
+  id: string;
+  label: string | null;
+  turns: number;
+  costUsd: number;
+  lastActiveAt: number;
+  createdAt: number;
 }
 
 export interface NewMessage {
@@ -188,4 +208,5 @@ export interface SearchOptions {
 export interface ConversationOptions {
   maxTokens?: number;
   fromTurn?: number;
+  sessionId?: string;
 }

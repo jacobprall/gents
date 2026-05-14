@@ -1,7 +1,10 @@
 import { createAgentLoop, createChildLoopFactory, inferProvider, type LoopEvent, type ProviderName } from "@gents/agent-loop";
 import {
+  closeAgentDB,
   closeWorkspaceDB,
   compactConversation,
+  createSession,
+  discoverBlueprints,
   getConfig,
   getCurrentTurn,
   getIndexStatus,
@@ -9,8 +12,14 @@ import {
   getSessionMetrics,
   hybridSearch,
   indexCodebase,
+  listSessions,
+  getActiveSession,
   scanSkillDirs,
+  setActiveSession,
+  type AgentBlueprint,
+  type AgentDB,
   type Permission,
+  type SessionSummary,
 } from "@gents/agent-db";
 import {
   confirmationGate,
@@ -26,6 +35,7 @@ import * as readline from "node:readline";
 
 import {
   accent,
+  bold,
   muted,
   success,
   Spinner,
@@ -43,7 +53,7 @@ import {
 import { availableProviders, resolveConfig } from "../config";
 import { createDefaultPrompt } from "../prompt";
 import { createRenderer } from "../markdown";
-import { openSession, openWorkspace } from "../session";
+import { listAgents, openAgent, openWorkspace, type AgentInfo } from "../session";
 
 const spinner = new Spinner();
 let md = createRenderer();
@@ -166,28 +176,109 @@ interface ModelEntry {
 }
 
 const MODEL_CATALOG: ModelEntry[] = [
-  // Anthropic
   { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: "anthropic" },
   { id: "claude-sonnet-4-20250514", label: "Claude Sonnet 4", provider: "anthropic" },
   { id: "claude-opus-4-20250514", label: "Claude Opus 4", provider: "anthropic" },
   { id: "claude-3-5-sonnet-20241022", label: "Claude 3.5 Sonnet", provider: "anthropic" },
   { id: "claude-3-5-haiku-20241022", label: "Claude 3.5 Haiku", provider: "anthropic" },
-  // OpenAI
   { id: "gpt-4o", label: "GPT-4o", provider: "openai" },
   { id: "gpt-4o-mini", label: "GPT-4o Mini", provider: "openai" },
   { id: "o3", label: "o3", provider: "openai" },
   { id: "o4-mini", label: "o4-mini", provider: "openai" },
-  // Google
   { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", provider: "google" },
   { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", provider: "google" },
   { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash", provider: "google" },
 ];
 
+// ── Interactive pickers ─────────────────────────────────────────────
+
+function ask(rl: readline.Interface, prompt: string): Promise<string> {
+  return new Promise((resolve) => rl.question(prompt, resolve));
+}
+
+function timeAgo(ms: number): string {
+  const delta = Date.now() - ms;
+  if (delta < 60_000) return "just now";
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)}m ago`;
+  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)}h ago`;
+  return `${Math.floor(delta / 86_400_000)}d ago`;
+}
+
+async function pickBlueprint(
+  rl: readline.Interface,
+  repoPath: string,
+): Promise<AgentBlueprint> {
+  const blueprints = discoverBlueprints(repoPath);
+  if (blueprints.length === 1) return blueprints[0]!;
+
+  process.stdout.write(`\n  ${bold("Available blueprints:")}\n\n`);
+  for (let i = 0; i < blueprints.length; i++) {
+    const bp = blueprints[i]!;
+    const desc = bp.description ? muted(bp.description) : "";
+    process.stdout.write(`    ${muted(String(i + 1) + ".")} ${bp.name} ${desc}\n`);
+  }
+
+  const ans = await ask(rl, `\n  Select blueprint ${muted(`[1]`)}: `);
+  const idx = parseInt(ans.trim(), 10);
+  if (idx >= 1 && idx <= blueprints.length) return blueprints[idx - 1]!;
+  return blueprints[0]!;
+}
+
+async function pickAgent(
+  rl: readline.Interface,
+  agents: AgentInfo[],
+): Promise<{ action: "existing"; agent: AgentInfo } | { action: "new" }> {
+  process.stdout.write(`\n  ${bold("Agents in this repo:")}\n\n`);
+  for (let i = 0; i < agents.length; i++) {
+    const a = agents[i]!;
+    const bpLabel = a.blueprintDescription ?? a.blueprintName ?? "unknown";
+    process.stdout.write(`    ${muted(String(i + 1) + ".")} ${a.name}  ${muted(bpLabel)}\n`);
+  }
+  process.stdout.write(`    ${muted("n.")} Create new agent\n`);
+
+  const ans = await ask(rl, `\n  Select agent ${muted(`[1]`)}: `);
+  const trimmed = ans.trim().toLowerCase();
+
+  if (trimmed === "n" || trimmed === "new") return { action: "new" };
+
+  const idx = parseInt(trimmed, 10);
+  if (idx >= 1 && idx <= agents.length) return { action: "existing", agent: agents[idx - 1]! };
+  return { action: "existing", agent: agents[0]! };
+}
+
+async function pickSession(
+  rl: readline.Interface,
+  sessions: SessionSummary[],
+): Promise<{ action: "resume"; sessionId: string } | { action: "fresh" }> {
+  if (sessions.length === 0) return { action: "fresh" };
+
+  process.stdout.write(`\n  ${bold("Sessions:")}\n\n`);
+  for (let i = 0; i < sessions.length; i++) {
+    const s = sessions[i]!;
+    const label = s.label ?? muted("(unlabeled)");
+    const info = `${String(s.turns)} turns ${muted("·")} $${s.costUsd.toFixed(2)} ${muted("·")} ${timeAgo(s.lastActiveAt)}`;
+    process.stdout.write(`    ${muted(String(i + 1) + ".")} ${label}  ${info}\n`);
+  }
+
+  const ans = await ask(rl, `\n  ${muted("[r]esume latest, [f]resh session, or [#] to pick?")} ${muted("[r]")}: `);
+  const trimmed = ans.trim().toLowerCase();
+
+  if (trimmed === "f" || trimmed === "fresh") return { action: "fresh" };
+
+  const idx = parseInt(trimmed, 10);
+  if (idx >= 1 && idx <= sessions.length) return { action: "resume", sessionId: sessions[idx - 1]!.id };
+
+  // Default: resume latest
+  return { action: "resume", sessionId: sessions[0]!.id };
+}
+
+// ── Slash commands ──────────────────────────────────────────────────
+
 async function handleSlashCommand(
   line: string,
-  db: Parameters<typeof getCurrentTurn>[0],
+  db: AgentDB,
   repoPath: string,
-): Promise<{ switchModel?: { model: string; provider: ProviderName } } | void> {
+): Promise<{ switchModel?: { model: string; provider: ProviderName }; newSession?: boolean } | void> {
   const body = line.slice(1).trim();
   const firstSpace = body.indexOf(" ");
   const cmd = (firstSpace === -1 ? body : body.slice(0, firstSpace)).toLowerCase();
@@ -204,6 +295,39 @@ async function handleSlashCommand(
         argRest.length > 0 ? argRest : "[Compaction via /compact — summarize earlier turns in subsequent context]";
       compactConversation(db, turn, summary);
       printInfo(muted(`  Compaction marker recorded through turn ${String(turn)}.`));
+      break;
+    }
+    case "fresh": {
+      return { newSession: true };
+    }
+    case "sessions": {
+      const sessions = listSessions(db);
+      if (sessions.length === 0) {
+        printInfo("  No sessions yet.");
+        break;
+      }
+      process.stdout.write("\n");
+      for (const s of sessions) {
+        const label = s.label ?? "(unlabeled)";
+        const active = s.id === db.activeSessionId ? accent(" ←") : "";
+        const info = `${String(s.turns)} turns ${muted("·")} $${s.costUsd.toFixed(2)} ${muted("·")} ${timeAgo(s.lastActiveAt)}`;
+        process.stdout.write(`  ${label}  ${info}${active}\n`);
+      }
+      process.stdout.write("\n");
+      break;
+    }
+    case "agents": {
+      const agents = listAgents(repoPath);
+      if (agents.length === 0) {
+        printInfo("  No agents.");
+        break;
+      }
+      process.stdout.write("\n");
+      for (const a of agents) {
+        const bpLabel = a.blueprintDescription ?? a.blueprintName ?? "unknown";
+        process.stdout.write(`  ${a.name}  ${muted(bpLabel)}\n`);
+      }
+      process.stdout.write("\n");
       break;
     }
     case "search": {
@@ -311,12 +435,15 @@ function handleModelCommand(
   process.stdout.write(`\n  ${muted("Usage: /model <name|number>")}\n\n`);
 }
 
+// ── Command ─────────────────────────────────────────────────────────
+
 export const chatCommand = new Command("chat")
   .description("Start or resume an interactive agent session")
   .argument("[message]", "Initial message to send (skips first prompt)")
   .option("--repo <path>", "Repository path", process.cwd())
-  .option("--session <id>", "Session ID", "default")
-  .option("--new", "Force new session")
+  .option("--agent <name>", "Agent name (default: interactive picker)")
+  .option("--session <id>", "Resume a specific session ID")
+  .option("--new", "Create new agent with default blueprint + fresh session")
   .option("--model <model>", "Override model")
   .option("--provider <provider>", "LLM provider (anthropic, openai, google)")
   .option("--no-index", "Skip index freshness check")
@@ -324,7 +451,8 @@ export const chatCommand = new Command("chat")
   .action(
     async (message: string | undefined, opts: {
       repo: string;
-      session: string;
+      agent?: string;
+      session?: string;
       new?: boolean;
       model?: string;
       provider?: string;
@@ -339,13 +467,78 @@ export const chatCommand = new Command("chat")
           ...(typeof opts.confirm === "boolean" ? { confirmDestructive: opts.confirm } : {}),
         });
 
+        const interactive = process.stdin.isTTY ?? false;
         const workspace = openWorkspace(repoPath);
-        const db = openSession(repoPath, {
-          session: opts.session,
-          forceNew: Boolean(opts.new),
-          workspace,
-        });
 
+        // ── Resolve which agent + session to use ────────────────
+        let agentName = opts.agent ?? "default";
+        let blueprint: AgentBlueprint | undefined;
+        let startFreshSession = Boolean(opts.new);
+        let explicitSessionId = opts.session;
+
+        if (interactive && !opts.agent && !opts.new) {
+          const agents = listAgents(repoPath);
+          const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+          try {
+            if (agents.length === 0) {
+              blueprint = await pickBlueprint(rl, repoPath);
+              agentName = blueprint.name === "gents-default" ? "default" : blueprint.name;
+              startFreshSession = true;
+            } else if (agents.length === 1 && agents[0]!.name === "default") {
+              agentName = "default";
+            } else {
+              const agentChoice = await pickAgent(rl, agents);
+              if (agentChoice.action === "new") {
+                blueprint = await pickBlueprint(rl, repoPath);
+                agentName = blueprint.name === "gents-default" ? "default" : blueprint.name;
+                startFreshSession = true;
+              } else {
+                agentName = agentChoice.agent.name;
+              }
+            }
+
+            if (!startFreshSession && !explicitSessionId) {
+              const tempDb = openAgent(repoPath, { name: agentName, workspace });
+              const sessions = listSessions(tempDb);
+              closeAgentDB(tempDb);
+
+              if (sessions.length > 0) {
+                const sessionChoice = await pickSession(rl, sessions);
+                if (sessionChoice.action === "fresh") {
+                  startFreshSession = true;
+                } else {
+                  explicitSessionId = sessionChoice.sessionId;
+                }
+              } else {
+                startFreshSession = true;
+              }
+            }
+          } finally {
+            rl.close();
+          }
+        }
+
+        const db = openAgent(repoPath, { name: agentName, blueprint, workspace });
+
+        // ── Resolve session ─────────────────────────────────────
+        if (explicitSessionId) {
+          setActiveSession(db, explicitSessionId);
+        } else if (startFreshSession) {
+          const session = createSession(db);
+          setActiveSession(db, session.id);
+          printDebug(`New session started (${session.id.slice(0, 8)})`);
+        } else {
+          const existing = getActiveSession(db);
+          if (existing) {
+            setActiveSession(db, existing.id);
+          } else {
+            const session = createSession(db);
+            setActiveSession(db, session.id);
+          }
+        }
+
+        // ── Index ───────────────────────────────────────────────
         if (opts.index !== false && config.autoIndex) {
           const status = getIndexStatus(db);
           const isInitial = status.totalChunks === 0;
@@ -369,11 +562,10 @@ export const chatCommand = new Command("chat")
           }
         }
 
+        // ── Build agent loop ────────────────────────────────────
         const registry = createToolRegistry();
         registerBuiltinTools(registry);
         const toolDefs = registry.listForLLM();
-
-        const interactive = process.stdin.isTTY ?? false;
 
         const governanceConfig = permissionsToGovernance(getPermissions(db));
 
@@ -410,13 +602,6 @@ export const chatCommand = new Command("chat")
         let activeProvider = config.provider;
         let activeApiKey = config.apiKey;
 
-        const childLoopFactory = createChildLoopFactory({
-          model: activeModel,
-          apiKey: activeApiKey,
-          provider: activeProvider,
-          parentRegistry: registry,
-        });
-
         let loop = await createAgentLoop({
           model: activeModel,
           apiKey: activeApiKey,
@@ -427,7 +612,12 @@ export const chatCommand = new Command("chat")
           repoPath,
           maxIterations,
           maxCostPerSession: config.maxCostPerSession,
-          childLoopFactory,
+          childLoopFactory: createChildLoopFactory({
+            model: activeModel,
+            apiKey: activeApiKey,
+            provider: activeProvider,
+            parentRegistry: registry,
+          }),
         });
 
         async function rebuildLoop(): Promise<void> {
@@ -450,6 +640,7 @@ export const chatCommand = new Command("chat")
           });
         }
 
+        // ── Non-interactive (piped) mode ────────────────────────
         if (!interactive) {
           const chunks: string[] = [];
           process.stdin.setEncoding("utf8");
@@ -470,16 +661,19 @@ export const chatCommand = new Command("chat")
             printError(e instanceof Error ? e.message : String(e));
             process.exitCode = 1;
           } finally {
+            try { closeAgentDB(db); } catch { /* best effort */ }
             try { closeWorkspaceDB(workspace); } catch { /* best effort */ }
           }
           process.exit(process.exitCode ?? 0);
         }
 
+        // ── Interactive REPL ────────────────────────────────────
         const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
         const shutdown = (code?: number): void => {
           spinner.stop();
           rl.close();
+          try { closeAgentDB(db); } catch { /* best effort */ }
           try { closeWorkspaceDB(workspace); } catch { /* best effort */ }
           process.exit(code ?? 0);
         };
@@ -496,7 +690,7 @@ export const chatCommand = new Command("chat")
 
         printBanner({
           version: "0.1.0",
-          session: opts.session,
+          session: db.activeSessionId?.slice(0, 8) ?? agentName,
           model: activeModel,
           provider: activeProvider,
           repoPath,
@@ -546,6 +740,11 @@ export const chatCommand = new Command("chat")
                     } catch (e) {
                       printError(e instanceof Error ? e.message : String(e));
                     }
+                  }
+                  if (result && "newSession" in result && result.newSession) {
+                    const session = createSession(db);
+                    setActiveSession(db, session.id);
+                    printInfo(muted(`  Fresh session started (${session.id.slice(0, 8)})`));
                   }
                 } catch (e) {
                   printError(e instanceof Error ? e.message : String(e));

@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 export const WORKSPACE_SCHEMA_VERSION = 1;
 
 export interface Migration {
@@ -57,6 +57,27 @@ CREATE TABLE IF NOT EXISTS skill_files (
   PRIMARY KEY (skill_name, path),
   FOREIGN KEY (skill_name) REFERENCES skills(name) ON DELETE CASCADE
 );
+`,
+  },
+  {
+    version: 5,
+    sql: `
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  label TEXT,
+  created_at INTEGER NOT NULL,
+  last_active_at INTEGER NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1
+);
+
+ALTER TABLE messages ADD COLUMN session_id TEXT REFERENCES sessions(id);
+ALTER TABLE events ADD COLUMN session_id TEXT REFERENCES sessions(id);
+ALTER TABLE metrics ADD COLUMN session_id TEXT REFERENCES sessions(id);
+ALTER TABLE compaction_markers ADD COLUMN session_id TEXT REFERENCES sessions(id);
+
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, turn);
+CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_metrics_session ON metrics(session_id, turn);
 `,
   },
 ];
@@ -145,17 +166,27 @@ CREATE TABLE IF NOT EXISTS schema_version (
   applied_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  label TEXT,
+  created_at INTEGER NOT NULL,
+  last_active_at INTEGER NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1
+);
+
 CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY,
   type TEXT NOT NULL,
   payload TEXT NOT NULL,
   turn INTEGER,
+  session_id TEXT REFERENCES sessions(id),
   created_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
 CREATE INDEX IF NOT EXISTS idx_events_turn ON events(turn);
+CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, created_at);
 
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -167,18 +198,21 @@ CREATE TABLE IF NOT EXISTS messages (
   tokens_in INTEGER,
   tokens_out INTEGER,
   cost_usd REAL,
+  session_id TEXT REFERENCES sessions(id),
   created_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_turn ON messages(turn);
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(role);
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, turn);
 
 CREATE TABLE IF NOT EXISTS compaction_markers (
   id TEXT PRIMARY KEY,
   up_to_turn INTEGER NOT NULL,
   summary TEXT NOT NULL,
   token_count INTEGER,
+  session_id TEXT REFERENCES sessions(id),
   created_at INTEGER NOT NULL
 );
 
@@ -245,7 +279,7 @@ CREATE TABLE IF NOT EXISTS config (
 );
 
 CREATE TABLE IF NOT EXISTS metrics (
-  turn INTEGER PRIMARY KEY,
+  turn INTEGER NOT NULL,
   model TEXT,
   input_tokens INTEGER NOT NULL DEFAULT 0,
   output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -253,8 +287,12 @@ CREATE TABLE IF NOT EXISTS metrics (
   cost_usd REAL NOT NULL DEFAULT 0,
   tool_calls INTEGER NOT NULL DEFAULT 0,
   elapsed_ms INTEGER,
-  created_at INTEGER
+  session_id TEXT REFERENCES sessions(id),
+  created_at INTEGER,
+  PRIMARY KEY (session_id, turn)
 );
+
+CREATE INDEX IF NOT EXISTS idx_metrics_session ON metrics(session_id, turn);
 
 CREATE TABLE IF NOT EXISTS tools (
   name TEXT PRIMARY KEY,

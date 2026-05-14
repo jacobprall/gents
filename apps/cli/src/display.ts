@@ -236,6 +236,9 @@ export function printHelp(): void {
   process.stdout.write("\n");
   process.stdout.write(`  ${bold("Commands")}\n\n`);
   process.stdout.write(cmd("/compact", "[msg]", "Compact conversation history") + "\n");
+  process.stdout.write(cmd("/fresh", "     ", "Start a fresh session (same agent)") + "\n");
+  process.stdout.write(cmd("/sessions", "  ", "List sessions for current agent") + "\n");
+  process.stdout.write(cmd("/agents", "    ", "List agents in this repo") + "\n");
   process.stdout.write(cmd("/search", " <q>", "Search the codebase index") + "\n");
   process.stdout.write(cmd("/index", "    ", "Rebuild the codebase index") + "\n");
   process.stdout.write(cmd("/model", " [id]", "List or switch models") + "\n");
